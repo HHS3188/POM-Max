@@ -1,0 +1,12 @@
+{
+  "Id": "POMMax",
+  "DisplayName": "Performance Optimization MAX",
+  "Author": "HHS3188",
+  "Version": "1.0.0",
+  "ManagerVersion": "0.22.14",
+  "AssemblyName": "POMMax.dll",
+  "EntryMethod": "POMMax.Main.Load",
+  "HomePage": "https://github.com/HHS3188/POM-Max",
+  "Repository": "https://raw.githubusercontent.com/HHS3188/POM-Max/main/Repository.json",
+  "Description": "Performance optimization, load timeout protection, and optional max performance mode for A Dance of Fire and Ice."
+}
