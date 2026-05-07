@@ -49,8 +49,7 @@ namespace POMMax
     public static class Main
     {
         private const int ProfileOff = 0;
-        private const int ProfileNormal = 1;
-        private const int ProfileMax = 2;
+        private const int ProfileMax = 1;
 
         private const string SourceUrl = "https://github.com/HHS3188/POM-Max";
         private const string DocsUrl = "https://github.com/HHS3188/POM-Max/blob/main/docs/%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E.md";
@@ -232,7 +231,6 @@ namespace POMMax
             GUILayout.Label("<b>" + Text("profile") + "</b>");
             GUILayout.BeginHorizontal();
             DrawProfileButton(ProfileOff, "Off");
-            DrawProfileButton(ProfileNormal, "Normal");
             DrawProfileButton(ProfileMax, "MAX");
             GUILayout.Space(18f);
             DrawOverdriveButton();
@@ -374,7 +372,7 @@ namespace POMMax
                 return ShouldRemoveDecorationEvent(ev, profile, overdrive);
             });
 
-            if (settings.disableBackgroundVideo && profile >= ProfileNormal)
+            if (settings.disableBackgroundVideo && profile > ProfileOff)
             {
                 TrySetEventValue(data.miscSettings, "bgVideo", "");
             }
@@ -783,7 +781,7 @@ namespace POMMax
                     QualitySettings.vSyncCount = 0;
                 }
 
-                if (settings.disableAntiAliasing && profile >= ProfileNormal)
+                if (settings.disableAntiAliasing && profile > ProfileOff)
                 {
                     QualitySettings.antiAliasing = 0;
                 }
