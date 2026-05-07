@@ -1,4 +1,5 @@
 *.pdb
+POMMax.dll
 *.cache
 *.cache.pdb
 Settings.xml

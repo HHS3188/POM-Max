@@ -1,7 +1,25 @@
 $ErrorActionPreference = 'Stop'
 
 $modDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$gameRoot = Split-Path -Parent (Split-Path -Parent $modDir)
+$candidateRoots = @()
+if ($env:ADOFAI_GAME_ROOT) {
+    $candidateRoots += $env:ADOFAI_GAME_ROOT
+}
+$candidateRoots += Split-Path -Parent (Split-Path -Parent $modDir)
+$candidateRoots += Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $modDir))
+
+$gameRoot = $null
+foreach ($candidate in $candidateRoots) {
+    if ($candidate -and (Test-Path (Join-Path $candidate 'A Dance of Fire and Ice_Data\Managed'))) {
+        $gameRoot = $candidate
+        break
+    }
+}
+
+if (-not $gameRoot) {
+    throw 'Could not locate A Dance of Fire and Ice. Set ADOFAI_GAME_ROOT to the game root.'
+}
+
 $managed = Join-Path $gameRoot 'A Dance of Fire and Ice_Data\Managed'
 $umm = Join-Path $managed 'UnityModManager'
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'

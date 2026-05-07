@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using ADOFAI;
 using HarmonyLib;
 using UnityEngine;
@@ -27,16 +28,16 @@ namespace POMMax
         public bool optimizeLevelEvents = true;
         public bool disableBackgroundVideo = true;
         public bool capDecorations = true;
-        public int maxDecorations = 5000;
-        public bool simplifyDecorationShaders = true;
+        public int maxDecorations = 20000;
+        public bool simplifyDecorationShaders = false;
         public bool throttleDecorationUpdates = true;
         public int decorationUpdateStride = 2;
         public bool enableLoadTimeout = true;
         public int maxLoadSeconds = 45;
         public bool boostGamePriority = true;
         public bool preventSleepDuringGameplay = true;
-        public bool maxPerformanceMode = false;
-        public bool throttleBackgroundProcesses = false;
+        public bool overdriveMode = false;
+        public bool throttleBackgroundProcesses = true;
         public bool verboseLogging = false;
 
         public override void Save(UnityModManager.ModEntry modEntry)
@@ -48,9 +49,13 @@ namespace POMMax
     public static class Main
     {
         private const int ProfileOff = 0;
-        private const int ProfileBalanced = 1;
-        private const int ProfilePerformance = 2;
-        private const int ProfileMax = 3;
+        private const int ProfileNormal = 1;
+        private const int ProfileMax = 2;
+
+        private const string SourceUrl = "https://github.com/HHS3188/POM-Max";
+        private const string DocsUrl = "https://github.com/HHS3188/POM-Max/blob/main/docs/%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E.md";
+        private const string UltimatePerformanceScheme = "e9a42b02-d5df-448d-aa00-03f14749eb61";
+        private const string HighPerformanceScheme = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
 
         private const uint EsContinuous = 0x80000000;
         private const uint EsSystemRequired = 0x00000001;
@@ -66,6 +71,14 @@ namespace POMMax
         private static int originalVSync;
         private static int originalAntiAliasing;
         private static AnisotropicFiltering originalAnisotropicFiltering;
+        private static int originalPixelLightCount;
+        private static float originalShadowDistance;
+        private static int originalShadowCascades;
+        private static float originalLodBias;
+        private static int originalMaximumLodLevel;
+        private static bool originalRealtimeReflectionProbes;
+        private static bool originalSoftParticles;
+        private static int originalGlobalTextureMipmapLimit;
         private static GCLatencyMode originalGcLatencyMode;
 
         private static bool loadingActive;
@@ -78,6 +91,11 @@ namespace POMMax
 
         private static bool capturedOwnPriority;
         private static ProcessPriorityClass originalOwnPriority;
+        private static bool capturedProcessorAffinity;
+        private static IntPtr originalProcessorAffinity;
+        private static bool powerPlanCaptured;
+        private static bool powerPlanApplied;
+        private static string originalPowerSchemeGuid;
         private static readonly Dictionary<int, ProcessPriorityClass> backgroundPriorities = new Dictionary<int, ProcessPriorityClass>();
         private static readonly HashSet<string> protectedProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -184,9 +202,9 @@ namespace POMMax
                 ApplyProcessBoost(true);
             }
 
-            if (settings.maxPerformanceMode && settings.throttleBackgroundProcesses && now >= nextBackgroundThrottle)
+            if (IsOverdriveMode() && settings.throttleBackgroundProcesses && now >= nextBackgroundThrottle)
             {
-                nextBackgroundThrottle = now + 5f;
+                nextBackgroundThrottle = now + 3f;
                 ThrottleBackgroundProcesses();
             }
 
@@ -214,10 +232,16 @@ namespace POMMax
             GUILayout.Label("<b>" + Text("profile") + "</b>");
             GUILayout.BeginHorizontal();
             DrawProfileButton(ProfileOff, "Off");
-            DrawProfileButton(ProfileBalanced, "Balanced");
-            DrawProfileButton(ProfilePerformance, "Performance");
+            DrawProfileButton(ProfileNormal, "Normal");
             DrawProfileButton(ProfileMax, "MAX");
+            GUILayout.Space(18f);
+            DrawOverdriveButton();
             GUILayout.EndHorizontal();
+            GUILayout.Label(Text("profileNote"));
+            if (IsOverdriveMode())
+            {
+                GUILayout.Label(Text("overdriveWarning"));
+            }
 
             GUILayout.Space(6f);
             GUILayout.Label("<b>" + Text("runtime") + "</b>");
@@ -247,12 +271,21 @@ namespace POMMax
             GUILayout.Label("<b>" + Text("system") + "</b>");
             settings.boostGamePriority = GUILayout.Toggle(settings.boostGamePriority, Text("boostPriority"));
             settings.preventSleepDuringGameplay = GUILayout.Toggle(settings.preventSleepDuringGameplay, Text("preventSleep"));
-            settings.maxPerformanceMode = GUILayout.Toggle(settings.maxPerformanceMode, Text("maxMode"));
             settings.throttleBackgroundProcesses = GUILayout.Toggle(settings.throttleBackgroundProcesses, Text("backgroundThrottle"));
             settings.verboseLogging = GUILayout.Toggle(settings.verboseLogging, Text("verbose"));
 
             GUILayout.Space(6f);
             GUILayout.Label(Text("note"));
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button(Text("docsLink"), GUILayout.Width(220)))
+            {
+                OpenUrl(DocsUrl);
+            }
+            if (GUILayout.Button(Text("sourceLink"), GUILayout.Width(220)))
+            {
+                OpenUrl(SourceUrl);
+            }
+            GUILayout.EndHorizontal();
             GUILayout.EndVertical();
         }
 
@@ -269,17 +302,27 @@ namespace POMMax
                 return ProfileOff;
             }
 
+            if (IsOverdriveMode())
+            {
+                return ProfileMax;
+            }
+
             return settings.optimizationProfile;
+        }
+
+        public static bool IsOverdriveMode()
+        {
+            return modEnabled && settings != null && settings.overdriveMode;
         }
 
         public static bool ShouldSimplifyDecorationShaders()
         {
-            return EffectiveProfile() >= ProfilePerformance && settings.simplifyDecorationShaders;
+            return IsOverdriveMode() && settings.simplifyDecorationShaders;
         }
 
         public static bool ShouldThrottleDecoration(scrDecoration decoration)
         {
-            if (EffectiveProfile() < ProfileMax || !settings.throttleDecorationUpdates)
+            if (!IsOverdriveMode() || !settings.throttleDecorationUpdates)
             {
                 return false;
             }
@@ -317,30 +360,31 @@ namespace POMMax
             }
 
             int profile = EffectiveProfile();
+            bool overdrive = IsOverdriveMode();
             int beforeEvents = data.levelEvents.Count;
             int beforeDecorations = data.decorations.Count;
 
             data.levelEvents.RemoveAll(delegate(LevelEvent ev)
             {
-                return ShouldRemoveActionEvent(ev, profile);
+                return ShouldRemoveActionEvent(ev, profile, overdrive);
             });
 
             data.decorations.RemoveAll(delegate(LevelEvent ev)
             {
-                return ShouldRemoveDecorationEvent(ev, profile);
+                return ShouldRemoveDecorationEvent(ev, profile, overdrive);
             });
 
-            if (settings.disableBackgroundVideo && profile >= ProfileBalanced)
+            if (settings.disableBackgroundVideo && profile >= ProfileNormal)
             {
                 TrySetEventValue(data.miscSettings, "bgVideo", "");
             }
 
-            if (settings.simplifyDecorationShaders && profile >= ProfilePerformance)
+            if (settings.simplifyDecorationShaders && overdrive)
             {
                 data.disableV15Features = true;
             }
 
-            if (settings.capDecorations && profile >= ProfilePerformance)
+            if (settings.capDecorations && profile >= ProfileMax)
             {
                 CapDecorations(data, settings.maxDecorations);
             }
@@ -453,7 +497,7 @@ namespace POMMax
             return Resources.UnloadUnusedAssets();
         }
 
-        private static bool ShouldRemoveActionEvent(LevelEvent ev, int profile)
+        private static bool ShouldRemoveActionEvent(LevelEvent ev, int profile, bool overdrive)
         {
             if (ev == null)
             {
@@ -466,7 +510,7 @@ namespace POMMax
                 return true;
             }
 
-            if (profile >= ProfilePerformance)
+            if (profile >= ProfileMax)
             {
                 if (type == LevelEventType.SetFilter ||
                     type == LevelEventType.SetFilterAdvanced ||
@@ -481,7 +525,7 @@ namespace POMMax
                 }
             }
 
-            if (profile >= ProfileMax)
+            if (overdrive)
             {
                 if (type == LevelEventType.CustomBackground ||
                     type == LevelEventType.Flash ||
@@ -495,19 +539,19 @@ namespace POMMax
             return false;
         }
 
-        private static bool ShouldRemoveDecorationEvent(LevelEvent ev, int profile)
+        private static bool ShouldRemoveDecorationEvent(LevelEvent ev, int profile, bool overdrive)
         {
             if (ev == null)
             {
                 return false;
             }
 
-            if (profile >= ProfilePerformance && ev.eventType == LevelEventType.AddParticle)
+            if (profile >= ProfileMax && ev.eventType == LevelEventType.AddParticle)
             {
                 return true;
             }
 
-            if (profile >= ProfileMax && !IsProtectedDecoration(ev))
+            if (overdrive && !IsProtectedDecoration(ev))
             {
                 if (ev.eventType == LevelEventType.AddParticle)
                 {
@@ -689,6 +733,14 @@ namespace POMMax
             originalVSync = QualitySettings.vSyncCount;
             originalAntiAliasing = QualitySettings.antiAliasing;
             originalAnisotropicFiltering = QualitySettings.anisotropicFiltering;
+            originalPixelLightCount = QualitySettings.pixelLightCount;
+            originalShadowDistance = QualitySettings.shadowDistance;
+            originalShadowCascades = QualitySettings.shadowCascades;
+            originalLodBias = QualitySettings.lodBias;
+            originalMaximumLodLevel = QualitySettings.maximumLODLevel;
+            originalRealtimeReflectionProbes = QualitySettings.realtimeReflectionProbes;
+            originalSoftParticles = QualitySettings.softParticles;
+            originalGlobalTextureMipmapLimit = QualitySettings.globalTextureMipmapLimit;
             try
             {
                 originalGcLatencyMode = GCSettings.LatencyMode;
@@ -731,7 +783,7 @@ namespace POMMax
                     QualitySettings.vSyncCount = 0;
                 }
 
-                if (settings.disableAntiAliasing && profile >= ProfileBalanced)
+                if (settings.disableAntiAliasing && profile >= ProfileNormal)
                 {
                     QualitySettings.antiAliasing = 0;
                 }
@@ -739,6 +791,18 @@ namespace POMMax
                 if (profile >= ProfileMax)
                 {
                     QualitySettings.anisotropicFiltering = AnisotropicFiltering.Disable;
+                }
+
+                if (IsOverdriveMode())
+                {
+                    QualitySettings.pixelLightCount = 0;
+                    QualitySettings.shadowDistance = 0f;
+                    QualitySettings.shadowCascades = 0;
+                    QualitySettings.lodBias = 0.35f;
+                    QualitySettings.maximumLODLevel = Math.Max(QualitySettings.maximumLODLevel, 1);
+                    QualitySettings.realtimeReflectionProbes = false;
+                    QualitySettings.softParticles = false;
+                    QualitySettings.globalTextureMipmapLimit = Math.Max(QualitySettings.globalTextureMipmapLimit, 1);
                 }
 
                 try
@@ -766,6 +830,14 @@ namespace POMMax
                     QualitySettings.vSyncCount = originalVSync;
                     QualitySettings.antiAliasing = originalAntiAliasing;
                     QualitySettings.anisotropicFiltering = originalAnisotropicFiltering;
+                    QualitySettings.pixelLightCount = originalPixelLightCount;
+                    QualitySettings.shadowDistance = originalShadowDistance;
+                    QualitySettings.shadowCascades = originalShadowCascades;
+                    QualitySettings.lodBias = originalLodBias;
+                    QualitySettings.maximumLODLevel = originalMaximumLodLevel;
+                    QualitySettings.realtimeReflectionProbes = originalRealtimeReflectionProbes;
+                    QualitySettings.softParticles = originalSoftParticles;
+                    QualitySettings.globalTextureMipmapLimit = originalGlobalTextureMipmapLimit;
                     try
                     {
                         GCSettings.LatencyMode = originalGcLatencyMode;
@@ -777,6 +849,7 @@ namespace POMMax
 
                 SetThreadExecutionState(EsContinuous);
                 timeEndPeriod(1);
+                RestorePowerPlan();
             }
             catch
             {
@@ -790,16 +863,39 @@ namespace POMMax
                 Process current = Process.GetCurrentProcess();
                 if (enable && modEnabled && settings != null && settings.boostGamePriority && EffectiveProfile() > ProfileOff)
                 {
+                    bool overdrive = IsOverdriveMode();
                     if (!capturedOwnPriority)
                     {
                         originalOwnPriority = current.PriorityClass;
                         capturedOwnPriority = true;
                     }
 
-                    ProcessPriorityClass desired = settings.maxPerformanceMode ? ProcessPriorityClass.High : ProcessPriorityClass.AboveNormal;
+                    ProcessPriorityClass desired = overdrive ? ProcessPriorityClass.High : ProcessPriorityClass.AboveNormal;
                     if (current.PriorityClass != desired)
                     {
                         current.PriorityClass = desired;
+                    }
+
+                    if (overdrive)
+                    {
+                        try
+                        {
+                            if (!capturedProcessorAffinity)
+                            {
+                                originalProcessorAffinity = current.ProcessorAffinity;
+                                capturedProcessorAffinity = true;
+                            }
+                            current.ProcessorAffinity = BuildAffinityMask();
+                        }
+                        catch
+                        {
+                        }
+
+                        TryApplyPowerPlan();
+                    }
+                    else
+                    {
+                        RestorePowerPlan();
                     }
 
                     try
@@ -822,6 +918,18 @@ namespace POMMax
                     {
                         current.PriorityClass = originalOwnPriority;
                     }
+                    if (capturedProcessorAffinity)
+                    {
+                        try
+                        {
+                            current.ProcessorAffinity = originalProcessorAffinity;
+                        }
+                        catch
+                        {
+                        }
+                        capturedProcessorAffinity = false;
+                    }
+                    RestorePowerPlan();
                     SetThreadExecutionState(EsContinuous);
                     timeEndPeriod(1);
                 }
@@ -875,9 +983,10 @@ namespace POMMax
                         backgroundPriorities[p.Id] = p.PriorityClass;
                     }
 
-                    if (p.PriorityClass != ProcessPriorityClass.Idle && p.PriorityClass != ProcessPriorityClass.BelowNormal)
+                    ProcessPriorityClass desired = IsOverdriveMode() ? ProcessPriorityClass.Idle : ProcessPriorityClass.BelowNormal;
+                    if (p.PriorityClass != ProcessPriorityClass.Idle && p.PriorityClass != desired)
                     {
-                        p.PriorityClass = ProcessPriorityClass.BelowNormal;
+                        p.PriorityClass = desired;
                     }
                 }
                 catch
@@ -900,6 +1009,111 @@ namespace POMMax
                 }
             }
             backgroundPriorities.Clear();
+        }
+
+        private static IntPtr BuildAffinityMask()
+        {
+            int processors = Math.Max(1, Environment.ProcessorCount);
+            if (IntPtr.Size == 4)
+            {
+                int mask32 = processors >= 31 ? -1 : ((1 << processors) - 1);
+                return new IntPtr(mask32);
+            }
+
+            long mask64 = processors >= 63 ? -1L : ((1L << processors) - 1L);
+            return new IntPtr(mask64);
+        }
+
+        private static void TryApplyPowerPlan()
+        {
+            if (powerPlanApplied)
+            {
+                return;
+            }
+
+            if (!powerPlanCaptured)
+            {
+                string output;
+                int exitCode;
+                if (RunPowerCfg("/getactivescheme", out output, out exitCode) && exitCode == 0)
+                {
+                    Match match = Regex.Match(output ?? "", "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+                    if (match.Success)
+                    {
+                        originalPowerSchemeGuid = match.Value;
+                    }
+                }
+                powerPlanCaptured = true;
+            }
+
+            string ignored;
+            int code;
+            if (RunPowerCfg("/setactive " + UltimatePerformanceScheme, out ignored, out code) && code == 0)
+            {
+                powerPlanApplied = true;
+                return;
+            }
+
+            if (RunPowerCfg("/setactive " + HighPerformanceScheme, out ignored, out code) && code == 0)
+            {
+                powerPlanApplied = true;
+            }
+        }
+
+        private static void RestorePowerPlan()
+        {
+            if (!powerPlanApplied || string.IsNullOrEmpty(originalPowerSchemeGuid))
+            {
+                powerPlanApplied = false;
+                return;
+            }
+
+            string ignored;
+            int code;
+            RunPowerCfg("/setactive " + originalPowerSchemeGuid, out ignored, out code);
+            powerPlanApplied = false;
+        }
+
+        private static bool RunPowerCfg(string arguments, out string output, out int exitCode)
+        {
+            output = "";
+            exitCode = -1;
+            try
+            {
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = "powercfg.exe";
+                startInfo.Arguments = arguments;
+                startInfo.UseShellExecute = false;
+                startInfo.CreateNoWindow = true;
+                startInfo.RedirectStandardOutput = true;
+                startInfo.RedirectStandardError = true;
+                Process process = Process.Start(startInfo);
+                if (process == null)
+                {
+                    return false;
+                }
+
+                if (!process.WaitForExit(2500))
+                {
+                    try
+                    {
+                        process.Kill();
+                    }
+                    catch
+                    {
+                    }
+                    return false;
+                }
+
+                output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+                exitCode = process.ExitCode;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Verbose("powercfg failed: " + ex.Message);
+                return false;
+            }
         }
 
         private static void ClampSettings()
@@ -951,9 +1165,30 @@ namespace POMMax
 
         private static void DrawProfileButton(int profile, string label)
         {
-            if (GUILayout.Toggle(settings.optimizationProfile == profile, label, "Button", GUILayout.Width(130)))
+            if (GUILayout.Toggle(!settings.overdriveMode && settings.optimizationProfile == profile, label, "Button", GUILayout.Width(130)))
             {
                 settings.optimizationProfile = profile;
+                settings.overdriveMode = false;
+            }
+        }
+
+        private static void DrawOverdriveButton()
+        {
+            bool selected = GUILayout.Toggle(settings.overdriveMode, "OVERDRIVE", "Button", GUILayout.Width(170));
+            if (selected != settings.overdriveMode)
+            {
+                settings.overdriveMode = selected;
+                if (selected)
+                {
+                    settings.optimizationProfile = ProfileMax;
+                    settings.forceTargetFrameRate = true;
+                    settings.disableVSync = true;
+                    settings.disableAntiAliasing = true;
+                    settings.disableCustomFrameRateEvents = true;
+                    settings.boostGamePriority = true;
+                    settings.preventSleepDuringGameplay = true;
+                    settings.throttleBackgroundProcesses = true;
+                }
             }
         }
 
@@ -969,6 +1204,22 @@ namespace POMMax
             }
             GUILayout.Label(Text("range") + min + "-" + max);
             GUILayout.EndHorizontal();
+        }
+
+        private static void OpenUrl(string url)
+        {
+            try
+            {
+                Process.Start(url);
+            }
+            catch (Exception ex)
+            {
+                if (modEntry != null)
+                {
+                    modEntry.Logger.Warning("Failed to open URL: " + url);
+                    modEntry.Logger.LogException(ex);
+                }
+            }
         }
 
         private static string Text(string key)
@@ -993,6 +1244,8 @@ namespace POMMax
                 case "title": return "Performance Optimization MAX";
                 case "summary": return "Optimizes frame pacing, level load/restart cost, and optional Windows process priority for heavy custom levels.";
                 case "profile": return "Optimization profile";
+                case "profileNote": return "Higher profiles usually improve performance more, but may add visual side effects or background limits. If decorations look wrong, lower the profile and test again; some .adofai levels are not compatible with every configuration.";
+                case "overdriveWarning": return "OVERDRIVE aggressively lowers background process priority, requests a high-performance Windows power plan, raises game scheduling priority, and reduces expensive quality settings.";
                 case "runtime": return "Runtime frame pacing";
                 case "forceFps": return "Force target frame rate";
                 case "targetFps": return "Target FPS:";
@@ -1006,19 +1259,20 @@ namespace POMMax
                 case "levelData": return "Level data optimizer";
                 case "optimizeEvents": return "Optimize decoded level events";
                 case "disableVideo": return "Disable background video on optimized loads";
-                case "capDecorations": return "Cap visual decorations in Performance/MAX profiles";
+                case "capDecorations": return "Cap visual decorations in MAX/OVERDRIVE";
                 case "maxDecorations": return "Max decorations:";
-                case "simpleShaders": return "Simplify decoration shaders in Performance/MAX profiles";
-                case "throttleDecorations": return "Throttle visual-only decoration updates in MAX profile";
+                case "simpleShaders": return "Simplify decoration shaders in OVERDRIVE only";
+                case "throttleDecorations": return "Throttle visual-only decoration updates in OVERDRIVE only";
                 case "stride": return "Decoration update stride:";
                 case "system": return "Windows performance mode";
                 case "boostPriority": return "Raise game process priority";
                 case "preventSleep": return "Prevent sleep and use 1 ms timer while active";
-                case "maxMode": return "MAX mode: stronger game priority";
                 case "backgroundThrottle": return "Lower priority of other user-session processes";
                 case "verbose": return "Verbose log optimization details";
                 case "range": return "Range: ";
-                case "note": return "Performance/MAX profiles may reduce visual effects. Editor scene level data is not optimized to avoid saving reduced maps.";
+                case "note": return "MAX/OVERDRIVE may reduce visual effects. Editor scene level data is not optimized to avoid saving reduced maps.";
+                case "docsLink": return "Open usage guide";
+                case "sourceLink": return "Open source code";
                 default: return key;
             }
         }
@@ -1031,6 +1285,8 @@ namespace POMMax
                 case "title": return "性能优化 MAX";
                 case "summary": return "优化重特效自定义谱面的帧率、加载/重开耗时，并提供可选 Windows 进程优先级策略。";
                 case "profile": return "优化档位";
+                case "profileNote": return "档位越高，优化提升通常越强，但可能带来视觉副作用或后台限制。如果遇到显示问题或装饰物问题，请逐渐降低档位测试；部分 .adofai 谱面并不兼容某些配置。";
+                case "overdriveWarning": return "OVERDRIVE 会尽可能降低后台进程优先级，请求 Windows 高性能电源计划，提高游戏调度优先级，并降低高开销画质设置。";
                 case "runtime": return "运行帧率策略";
                 case "forceFps": return "强制目标帧率";
                 case "targetFps": return "目标 FPS:";
@@ -1044,19 +1300,20 @@ namespace POMMax
                 case "levelData": return "谱面数据优化";
                 case "optimizeEvents": return "优化解码后的谱面事件";
                 case "disableVideo": return "优化加载时禁用背景视频";
-                case "capDecorations": return "Performance/MAX 档限制视觉装饰数量";
+                case "capDecorations": return "MAX/OVERDRIVE 档限制视觉装饰数量";
                 case "maxDecorations": return "最大装饰数量:";
-                case "simpleShaders": return "Performance/MAX 档简化装饰 shader";
-                case "throttleDecorations": return "MAX 档节流纯视觉装饰更新";
+                case "simpleShaders": return "仅 OVERDRIVE 简化装饰 shader";
+                case "throttleDecorations": return "仅 OVERDRIVE 节流纯视觉装饰更新";
                 case "stride": return "装饰更新间隔:";
                 case "system": return "Windows 性能模式";
                 case "boostPriority": return "提高游戏进程优先级";
                 case "preventSleep": return "启用时防止睡眠并使用 1ms 计时器";
-                case "maxMode": return "MAX 模式：更强游戏优先级";
                 case "backgroundThrottle": return "降低同一用户会话中其他进程优先级";
                 case "verbose": return "记录详细优化日志";
                 case "range": return "范围: ";
-                case "note": return "Performance/MAX 档可能减少视觉特效。编辑器场景不会优化谱面数据，避免保存成被削减的谱面。";
+                case "note": return "MAX/OVERDRIVE 可能减少视觉特效。编辑器场景不会优化谱面数据，避免保存成被削减的谱面。";
+                case "docsLink": return "打开使用说明";
+                case "sourceLink": return "打开源代码";
                 default: return key;
             }
         }
@@ -1069,6 +1326,8 @@ namespace POMMax
                 case "title": return "성능 최적화 MAX";
                 case "summary": return "무거운 커스텀 레벨의 프레임, 로딩/재시작 비용, Windows 프로세스 우선순위를 최적화합니다.";
                 case "profile": return "최적화 프로필";
+                case "profileNote": return "프로필이 높을수록 성능 향상은 커질 수 있지만 시각적 부작용이나 백그라운드 제한이 생길 수 있습니다. 장식 표시 문제가 있으면 낮은 프로필부터 다시 테스트하세요. 일부 .adofai 레벨은 모든 설정과 호환되지 않습니다.";
+                case "overdriveWarning": return "OVERDRIVE는 백그라운드 프로세스 우선순위를 최대한 낮추고, Windows 고성능 전원 계획을 요청하며, 게임 우선순위를 높이고 비싼 품질 옵션을 줄입니다.";
                 case "runtime": return "런타임 프레임 설정";
                 case "forceFps": return "목표 프레임 강제";
                 case "targetFps": return "목표 FPS:";
@@ -1082,19 +1341,20 @@ namespace POMMax
                 case "levelData": return "레벨 데이터 최적화";
                 case "optimizeEvents": return "디코딩된 레벨 이벤트 최적화";
                 case "disableVideo": return "최적화 로딩에서 배경 비디오 비활성화";
-                case "capDecorations": return "Performance/MAX 프로필에서 장식 수 제한";
+                case "capDecorations": return "MAX/OVERDRIVE에서 시각 장식 수 제한";
                 case "maxDecorations": return "최대 장식 수:";
-                case "simpleShaders": return "Performance/MAX 프로필에서 장식 셰이더 단순화";
-                case "throttleDecorations": return "MAX 프로필에서 순수 시각 장식 업데이트 절감";
+                case "simpleShaders": return "OVERDRIVE에서만 장식 셰이더 단순화";
+                case "throttleDecorations": return "OVERDRIVE에서만 순수 시각 장식 업데이트 절감";
                 case "stride": return "장식 업데이트 간격:";
                 case "system": return "Windows 성능 모드";
                 case "boostPriority": return "게임 프로세스 우선순위 상승";
                 case "preventSleep": return "활성화 중 절전 방지 및 1ms 타이머 사용";
-                case "maxMode": return "MAX 모드: 더 강한 게임 우선순위";
                 case "backgroundThrottle": return "같은 사용자 세션의 다른 프로세스 우선순위 낮춤";
                 case "verbose": return "자세한 최적화 로그";
                 case "range": return "범위: ";
-                case "note": return "Performance/MAX 프로필은 시각 효과를 줄일 수 있습니다. 저장 손상을 막기 위해 에디터 장면의 데이터는 최적화하지 않습니다.";
+                case "note": return "MAX/OVERDRIVE는 시각 효과를 줄일 수 있습니다. 저장 손상을 막기 위해 에디터 장면의 데이터는 최적화하지 않습니다.";
+                case "docsLink": return "사용 설명 열기";
+                case "sourceLink": return "소스 코드 열기";
                 default: return key;
             }
         }
