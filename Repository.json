@@ -2,8 +2,8 @@
   "Releases": [
     {
       "Id": "POMMax",
-        "Version": "2.0.0",
-        "DownloadUrl": "https://github.com/HHS3188/POM-Max/releases/download/v2.0.0/POM-Max-2.0.0.zip"
+      "Version": "2.1.5",
+      "DownloadUrl": "https://github.com/HHS3188/POM-Max/releases/download/v2.1.5/POM-Max-2.1.5.zip"
     }
   ]
 }

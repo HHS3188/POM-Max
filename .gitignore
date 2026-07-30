@@ -5,3 +5,8 @@ POMMax.dll
 Settings.xml
 bin/
 obj/
+.codegraph/
+/release/
+/installer/
+/Build-Installer.ps1
+/dist/Info.json

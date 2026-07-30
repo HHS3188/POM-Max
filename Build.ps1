@@ -22,9 +22,16 @@ if (-not $gameRoot) {
 
 $managed = Join-Path $gameRoot 'A Dance of Fire and Ice_Data\Managed'
 $umm = Join-Path $managed 'UnityModManager'
-$csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$output = Join-Path $modDir 'POMMax.dll'
+$windowsRoot = if ($env:WINDIR) { $env:WINDIR } else { $env:SystemRoot }
+if (-not $windowsRoot) {
+    $windowsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+}
+$csc = Join-Path $windowsRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$dist = Join-Path $modDir 'dist'
+$output = Join-Path $dist 'POMMax.dll'
 $source = Join-Path $modDir 'POMMax.cs'
+
+New-Item -ItemType Directory -Path $dist -Force | Out-Null
 
 $args = @(
     '/nologo',
@@ -34,7 +41,7 @@ $args = @(
     '/codepage:65001',
     '/target:library',
     '/optimize+',
-    '/debug:pdbonly',
+    '/debug-',
     "/out:$output",
     ('/reference:' + (Join-Path $managed 'mscorlib.dll')),
     ('/reference:' + (Join-Path $managed 'System.dll')),
@@ -49,6 +56,8 @@ $args = @(
     ('/reference:' + (Join-Path $managed 'UnityEngine.CoreModule.dll')),
     ('/reference:' + (Join-Path $managed 'UnityEngine.IMGUIModule.dll')),
     ('/reference:' + (Join-Path $managed 'UnityEngine.InputLegacyModule.dll')),
+    ('/reference:' + (Join-Path $managed 'UnityEngine.Physics2DModule.dll')),
+    ('/reference:' + (Join-Path $managed 'UnityEngine.TextRenderingModule.dll')),
     ('/reference:' + (Join-Path $managed 'UnityEngine.VideoModule.dll')),
     ('/reference:' + (Join-Path $umm '0Harmony.dll')),
     ('/reference:' + (Join-Path $umm 'UnityModManager.dll')),
@@ -59,3 +68,6 @@ $args = @(
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
+
+Copy-Item -LiteralPath (Join-Path $modDir 'Info.json') -Destination (Join-Path $dist 'Info.json') -Force
+Write-Host "Built: $output"
