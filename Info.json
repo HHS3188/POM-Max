@@ -2,11 +2,11 @@
   "Id": "POMMax",
   "DisplayName": "Performance Optimization MAX",
   "Author": "HHS3188",
-  "Version": "2.1.5",
+  "Version": "3.0.0",
   "ManagerVersion": "0.22.14",
   "AssemblyName": "POMMax.dll",
   "EntryMethod": "POMMax.Main.Load",
   "HomePage": "https://github.com/HHS3188/POM-Max",
   "Repository": "https://raw.githubusercontent.com/HHS3188/POM-Max/main/Repository.json",
-  "Description": "Deterministic MAX and EXTREME performance profiles with custom texture optimization for A Dance of Fire and Ice."
+  "Description": "Safe MAX and EXTREME profiles with pre-decode texture limiting, load-phase scheduling, upload-buffer tuning, and compatibility isolation for ADOFAI 3.2.0-3.3.1."
 }

@@ -6,6 +6,8 @@ Settings.xml
 bin/
 obj/
 .codegraph/
+.analysis/
+artifacts/
 /release/
 /installer/
 /Build-Installer.ps1

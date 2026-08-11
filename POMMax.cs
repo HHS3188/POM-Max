@@ -5,15 +5,13 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
-using System.Reflection.Emit;
 using System.Runtime;
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
 using ADOFAI;
+using DG.Tweening;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.Profiling;
-using UnityEngine.SceneManagement;
 using UnityModManagerNet;
 
 namespace POMMax
@@ -62,9 +60,6 @@ namespace POMMax
 
         private const string SourceUrl = "https://github.com/HHS3188/POM-Max";
         private const string DocsUrl = "https://github.com/HHS3188/POM-Max/blob/main/docs/%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E.md";
-        private const string UltimatePerformanceScheme = "e9a42b02-d5df-448d-aa00-03f14749eb61";
-        private const string HighPerformanceScheme = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
-
         private const uint EsContinuous = 0x80000000;
         private const uint EsSystemRequired = 0x00000001;
         private const uint EsDisplayRequired = 0x00000002;
@@ -76,8 +71,13 @@ namespace POMMax
         private static bool modEnabled;
         private static bool capturedQualitySettings;
         private static int originalTargetFrameRate;
+        private static bool originalRunInBackground;
+        private static UnityEngine.ThreadPriority originalBackgroundLoadingPriority;
         private static int originalVSync;
         private static int originalAntiAliasing;
+        private static int originalAsyncUploadTimeSlice;
+        private static int originalAsyncUploadBufferSize;
+        private static bool originalAsyncUploadPersistentBuffer;
         private static AnisotropicFiltering originalAnisotropicFiltering;
         private static int originalPixelLightCount;
         private static float originalShadowDistance;
@@ -90,37 +90,15 @@ namespace POMMax
         private static GCLatencyMode originalGcLatencyMode;
 
         private static bool loadingActive;
-        private static bool abortingLoad;
         private static int loadingDepth;
         private static float loadingStartedAt;
         private static string loadingLabel = "";
         private static float nextRuntimeApply;
-        private static float nextBackgroundThrottle;
-        private static bool runtimeDecorationBudgetAnalyzed;
-        private static int runtimeDecorationManagerId;
 
         private static bool capturedOwnPriority;
         private static ProcessPriorityClass originalOwnPriority;
-        private static bool capturedProcessorAffinity;
-        private static IntPtr originalProcessorAffinity;
-        private static bool powerPlanCaptured;
-        private static bool powerPlanApplied;
-        private static bool timerPeriodApplied;
-        private static string originalPowerSchemeGuid;
-        private static readonly Dictionary<int, ProcessPriorityClass> backgroundPriorities = new Dictionary<int, ProcessPriorityClass>();
-        private static readonly HashSet<string> protectedProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "Idle", "System", "Registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass",
-            "svchost", "fontdrvhost", "dwm", "audiodg", "explorer", "steam", "steamwebhelper",
-            "A Dance of Fire and Ice", "UnityCrashHandler64", "UnityModManager", "OpenAI.Codex", "Codex"
-        };
-
-        [DllImport("winmm.dll")]
-        private static extern uint timeBeginPeriod(uint period);
-
-        [DllImport("winmm.dll")]
-        private static extern uint timeEndPeriod(uint period);
-
+        private static int configuredTweenerCapacity;
+        private static int configuredSequenceCapacity;
         [DllImport("kernel32.dll")]
         private static extern uint SetThreadExecutionState(uint flags);
 
@@ -150,17 +128,18 @@ namespace POMMax
                     if (harmony == null)
                     {
                         harmony = new Harmony(entry.Info.Id);
-                        harmony.PatchAll(Assembly.GetExecutingAssembly());
+                        ApplyHarmonyPatches();
                     }
 
                     modEnabled = true;
                     OptimizationNotificationOverlay.Ensure();
-                    abortingLoad = false;
                     RestoreRuntimeDecorations();
                     TextureOptimization.ResetSession(true);
                     CaptureQualitySettings();
                     ApplyRuntimePerformance(true);
                     ApplyProcessBoost(true);
+                    TextureOptimization.RefreshCompatibilityState(true);
+                    CompatibilityDiagnostics.Report();
                     entry.Logger.Log("POM Max enabled. " + GetProfileDiagnosticText());
                 }
                 else
@@ -169,12 +148,10 @@ namespace POMMax
                     OptimizationNotificationOverlay.Hide();
                     loadingActive = false;
                     loadingDepth = 0;
-                    abortingLoad = false;
                     RestoreRuntimeDecorations();
                     TextureOptimization.ResetSession(true);
 
                     RestoreRuntimeSettings();
-                    RestoreBackgroundPriorities();
                     ApplyProcessBoost(false);
 
                     if (harmony != null)
@@ -193,20 +170,97 @@ namespace POMMax
                 modEnabled = false;
                 entry.Logger.Error("POM Max failed to toggle.");
                 entry.Logger.LogException(ex);
+                SafeDisableAfterFailure();
                 return false;
             }
         }
 
         private static bool OnUnload(UnityModManager.ModEntry entry)
         {
+            modEnabled = false;
             RestoreRuntimeDecorations();
             TextureOptimization.ResetSession(true);
             RestoreRuntimeSettings();
-            RestoreBackgroundPriorities();
             ApplyProcessBoost(false);
+            if (harmony != null)
+            {
+                harmony.UnpatchAll(entry.Info.Id);
+                harmony = null;
+            }
             GuiTheme.Dispose();
             OptimizationNotificationOverlay.Dispose();
             return true;
+        }
+
+        private static void ApplyHarmonyPatches()
+        {
+            int applied = 0;
+            int skipped = 0;
+            Type[] types = Assembly.GetExecutingAssembly().GetTypes();
+            for (int i = 0; i < types.Length; i++)
+            {
+                Type type = types[i];
+                if (type.GetCustomAttributes(typeof(HarmonyPatch), true).Length == 0)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    IEnumerable<MethodBase> originals = harmony.CreateClassProcessor(type).Patch();
+                    int count = 0;
+                    if (originals != null)
+                    {
+                        foreach (MethodBase unused in originals)
+                        {
+                            count++;
+                        }
+                    }
+                    if (count > 0)
+                    {
+                        applied += count;
+                    }
+                    else
+                    {
+                        skipped++;
+                        modEntry.Logger.Warning("[Compatibility] Optional patch skipped: " + type.FullName + ".");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    skipped++;
+                    modEntry.Logger.Warning("[Compatibility] Optional patch failed and was isolated: " + type.FullName + ".");
+                    modEntry.Logger.LogException(ex);
+                }
+            }
+
+            if (applied == 0)
+            {
+                throw new InvalidOperationException("No compatible POM-Max patches were found for this game build.");
+            }
+            modEntry.Logger.Log("[Compatibility] Harmony patches applied=" + applied + ", skipped=" + skipped + ".");
+        }
+
+        private static void SafeDisableAfterFailure()
+        {
+            try
+            {
+                loadingActive = false;
+                loadingDepth = 0;
+                RestoreRuntimeDecorations();
+                TextureOptimization.ResetSession(true);
+                RestoreRuntimeSettings();
+                ApplyProcessBoost(false);
+                OptimizationNotificationOverlay.Hide();
+                if (harmony != null && modEntry != null)
+                {
+                    harmony.UnpatchAll(modEntry.Info.Id);
+                    harmony = null;
+                }
+            }
+            catch
+            {
+            }
         }
 
         private static void OnUpdate(UnityModManager.ModEntry entry, float deltaTime)
@@ -220,25 +274,8 @@ namespace POMMax
             TextureOptimization.Tick(now);
             if (now >= nextRuntimeApply)
             {
-                nextRuntimeApply = now + 1f;
+                nextRuntimeApply = now + 10f;
                 ApplyRuntimePerformance(false);
-                ApplyProcessBoost(true);
-                RefreshRuntimeDecorationBudget(false);
-            }
-
-            if (IsOverdriveMode() && settings.throttleBackgroundProcesses && now >= nextBackgroundThrottle)
-            {
-                nextBackgroundThrottle = now + 30f;
-                ThrottleBackgroundProcesses();
-            }
-
-            if (settings.enableLoadTimeout && loadingActive && !abortingLoad)
-            {
-                float elapsed = now - loadingStartedAt;
-                if (elapsed > settings.maxLoadSeconds)
-                {
-                    AbortLoading(elapsed);
-                }
             }
         }
 
@@ -334,120 +371,10 @@ namespace POMMax
 
         public static void ResetRuntimeDecorationBudget()
         {
-            RestoreRuntimeDecorations();
-            runtimeDecorationBudgetAnalyzed = false;
-            runtimeDecorationManagerId = 0;
-        }
-
-        public static void RefreshRuntimeDecorationBudget(bool rebuild)
-        {
-            if (!modEnabled || settings == null || !IsOverdriveMode())
-            {
-                RestoreRuntimeDecorations();
-                return;
-            }
-
-            scrDecorationManager manager;
-            try
-            {
-                manager = scrDecorationManager.instance;
-            }
-            catch
-            {
-                return;
-            }
-
-            if (manager == null || manager.allDecorations == null)
-            {
-                return;
-            }
-
-            int managerId = manager.GetInstanceID();
-            if (!rebuild
-                && runtimeDecorationBudgetAnalyzed
-                && runtimeDecorationManagerId == managerId)
-            {
-                return;
-            }
-
-            RestoreRuntimeDecorations();
-
-            int activeCount = 0;
-            int protectedCount = 0;
-            for (int i = 0; i < manager.allDecorations.Count; i++)
-            {
-                scrDecoration decoration = manager.allDecorations[i];
-                if (decoration == null || decoration.gameObject == null || !decoration.gameObject.activeSelf)
-                {
-                    continue;
-                }
-
-                activeCount++;
-                if (IsProtectedRuntimeDecoration(decoration))
-                {
-                    protectedCount++;
-                }
-            }
-
-            runtimeDecorationBudgetAnalyzed = true;
-            runtimeDecorationManagerId = managerId;
-            TextureOptimization.RecordRuntimeDecorations(
-                activeCount,
-                0,
-                protectedCount,
-                activeCount);
-
-            if (rebuild && modEntry != null)
-            {
-                modEntry.Logger.Log(
-                    "[RuntimeDecorationBudget] compatibility guard: active=" + activeCount
-                    + ", remaining=" + activeCount
-                    + ", optimized=0"
-                    + ", protected=" + protectedCount
-                    + ", preservedAll=true"
-                    + ".");
-            }
-        }
-
-        private static bool IsProtectedRuntimeDecoration(scrDecoration decoration)
-        {
-            if (decoration == null || !(decoration is scrVisualDecoration))
-            {
-                return true;
-            }
-
-            if (decoration.sourceLevelEvent == null
-                || decoration.useHitbox
-                || decoration.followPlanet != null
-                || decoration.stickToFloor
-                || decoration.placementType == DecPlacementType.Camera
-                || decoration.placementType == DecPlacementType.CameraAspect)
-            {
-                return true;
-            }
-
-            if ((decoration.cfpCache != null && decoration.cfpCache.Length > 0)
-                || (decoration.hitEffects != null && decoration.hitEffects.Count > 0)
-                || (decoration.hitboxEvents != null && decoration.hitboxEvents.Count > 0))
-            {
-                return true;
-            }
-
-            if (IsProtectedDecoration(decoration.sourceLevelEvent)
-                || ContainsProtectedUiToken(decoration.decorationTag)
-                || ContainsProtectedUiToken(decoration.gameObjectName)
-                || ContainsProtectedUiToken(decoration.gameObject.name))
-            {
-                return true;
-            }
-
-            return false;
         }
 
         private static void RestoreRuntimeDecorations()
         {
-            runtimeDecorationBudgetAnalyzed = false;
-            runtimeDecorationManagerId = 0;
         }
 
         public static bool ShouldBlockCustomFrameRate(bool enable)
@@ -464,64 +391,17 @@ namespace POMMax
 
             int beforeEvents = data.levelEvents != null ? data.levelEvents.Count : 0;
             int beforeDecorations = data.decorations != null ? data.decorations.Count : 0;
-            if (EffectiveProfile() == ProfileOff || !settings.optimizeLevelEvents)
-            {
-                TextureOptimization.RecordLevelData(
-                    beforeEvents,
-                    beforeEvents,
-                    beforeDecorations,
-                    beforeDecorations,
-                    false);
-                return;
-            }
-
-            if (ADOBase.isLevelEditor && ADOBase.editor != null)
-            {
-                Verbose("Skipped LevelData optimization in editor scene to avoid saving reduced maps.");
-                TextureOptimization.RecordLevelData(
-                    beforeEvents,
-                    beforeEvents,
-                    beforeDecorations,
-                    beforeDecorations,
-                    true);
-                return;
-            }
-
-            int profile = EffectiveProfile();
-            bool overdrive = IsOverdriveMode();
-
-            data.levelEvents.RemoveAll(delegate(LevelEvent ev)
-            {
-                return ShouldRemoveActionEvent(ev, profile, overdrive);
-            });
-
-            data.decorations.RemoveAll(delegate(LevelEvent ev)
-            {
-                return ShouldRemoveDecorationEvent(ev, profile, overdrive);
-            });
-
-            if (settings.disableBackgroundVideo && profile > ProfileOff)
-            {
-                TrySetEventValue(data.miscSettings, "bgVideo", "");
-            }
-
-            if (settings.capDecorations && profile >= ProfileMax)
-            {
-                CapDecorations(data, settings.maxDecorations);
-            }
-
-            int removedEvents = beforeEvents - data.levelEvents.Count;
-            int removedDecorations = beforeDecorations - data.decorations.Count;
+            bool editorData = ADOBase.isLevelEditor && ADOBase.editor != null;
             TextureOptimization.RecordLevelData(
                 beforeEvents,
-                data.levelEvents.Count,
+                beforeEvents,
                 beforeDecorations,
-                data.decorations.Count,
-                false);
-            if (removedEvents > 0 || removedDecorations > 0)
-            {
-                Verbose("Optimized level data. Removed events=" + removedEvents + ", decorations=" + removedDecorations + ".");
-            }
+                beforeDecorations,
+                editorData);
+
+            // Never mutate decoded chart data. Removing visual events made high-effect
+            // charts faster at the cost of broken animations and black decorations.
+            Verbose("Level data preserved. Events=" + beforeEvents + ", decorations=" + beforeDecorations + ".");
         }
 
         public static void BeginLoading(string label)
@@ -538,9 +418,9 @@ namespace POMMax
             }
 
             loadingActive = true;
-            abortingLoad = false;
             loadingStartedAt = Time.realtimeSinceStartup;
             loadingLabel = label ?? "Loading";
+            ApplyLoadingPolicy(true);
             Verbose("Loading started: " + loadingLabel);
         }
 
@@ -563,7 +443,7 @@ namespace POMMax
 
             float elapsed = Time.realtimeSinceStartup - loadingStartedAt;
             loadingActive = false;
-            abortingLoad = false;
+            ApplyLoadingPolicy(false);
             TextureOptimization.RecordLoadingDuration(elapsed);
             Verbose("Loading finished: " + (label ?? loadingLabel) + " in " + elapsed.ToString("0.00") + "s.");
         }
@@ -571,33 +451,29 @@ namespace POMMax
         public static IEnumerator WrapLoadingCoroutine(IEnumerator inner, string label)
         {
             BeginLoading(label);
-            while (true)
+            try
             {
-                object current = null;
-                bool moved = false;
-                try
+                while (true)
                 {
-                    moved = inner != null && inner.MoveNext();
+                    object current = null;
+                    bool moved = inner != null && inner.MoveNext();
                     if (moved)
                     {
                         current = inner.Current;
                     }
-                }
-                catch
-                {
-                    EndLoading(label);
-                    throw;
-                }
 
-                if (!moved)
-                {
-                    break;
-                }
+                    if (!moved)
+                    {
+                        break;
+                    }
 
-                yield return current;
+                    yield return current;
+                }
             }
-
-            EndLoading(label);
+            finally
+            {
+                EndLoading(label);
+            }
         }
 
         public static void MaybeFlushUnusedMemory(ADOBase instance)
@@ -625,291 +501,6 @@ namespace POMMax
             return Resources.UnloadUnusedAssets();
         }
 
-        private static bool ShouldRemoveActionEvent(LevelEvent ev, int profile, bool overdrive)
-        {
-            if (ev == null)
-            {
-                return false;
-            }
-
-            LevelEventType type = ev.eventType;
-            if (settings.disableCustomFrameRateEvents && type == LevelEventType.SetFrameRate)
-            {
-                return true;
-            }
-
-            if (profile >= ProfileMax)
-            {
-                if (type == LevelEventType.SetFilter ||
-                    type == LevelEventType.SetFilterAdvanced ||
-                    type == LevelEventType.Bloom ||
-                    type == LevelEventType.HallOfMirrors ||
-                    type == LevelEventType.ScreenTile ||
-                    type == LevelEventType.ScreenScroll ||
-                    type == LevelEventType.SetParticle ||
-                    type == LevelEventType.EmitParticle)
-                {
-                    return true;
-                }
-            }
-
-            if (overdrive)
-            {
-                if (type == LevelEventType.Flash ||
-                    type == LevelEventType.ShakeScreen)
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static bool ShouldRemoveDecorationEvent(LevelEvent ev, int profile, bool overdrive)
-        {
-            if (ev == null)
-            {
-                return false;
-            }
-
-            if (profile >= ProfileMax && ev.eventType == LevelEventType.AddParticle)
-            {
-                return true;
-            }
-
-            if (overdrive && !IsProtectedDecoration(ev))
-            {
-                if (ev.eventType == LevelEventType.AddParticle)
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static void CapDecorations(LevelData data, int max)
-        {
-            if (data == null || data.decorations == null || max <= 0 || data.decorations.Count <= max)
-            {
-                return;
-            }
-
-            List<LevelEvent> protectedDecorations = new List<LevelEvent>();
-            List<LevelEvent> removableDecorations = new List<LevelEvent>();
-            for (int i = 0; i < data.decorations.Count; i++)
-            {
-                LevelEvent ev = data.decorations[i];
-                if (IsProtectedDecoration(ev))
-                {
-                    protectedDecorations.Add(ev);
-                }
-                else
-                {
-                    removableDecorations.Add(ev);
-                }
-            }
-
-            int slots = max - protectedDecorations.Count;
-            HashSet<LevelEvent> keep = new HashSet<LevelEvent>();
-            for (int i = 0; i < protectedDecorations.Count; i++)
-            {
-                keep.Add(protectedDecorations[i]);
-            }
-
-            if (slots > 0 && removableDecorations.Count > 0)
-            {
-                double step = (double)removableDecorations.Count / (double)slots;
-                for (int i = 0; i < slots; i++)
-                {
-                    int index = (int)Math.Floor(i * step);
-                    if (index < 0)
-                    {
-                        index = 0;
-                    }
-                    if (index >= removableDecorations.Count)
-                    {
-                        index = removableDecorations.Count - 1;
-                    }
-                    keep.Add(removableDecorations[index]);
-                }
-            }
-
-            for (int i = data.decorations.Count - 1; i >= 0; i--)
-            {
-                if (!keep.Contains(data.decorations[i]))
-                {
-                    data.decorations.RemoveAt(i);
-                }
-            }
-        }
-
-        private static bool IsProtectedDecoration(LevelEvent ev)
-        {
-            Dictionary<string, object> eventData = ev != null ? ev.GetData() : null;
-            if (eventData == null)
-            {
-                return false;
-            }
-
-            if (ev.eventType == LevelEventType.AddText || ev.eventType == LevelEventType.SetText)
-            {
-                return true;
-            }
-
-            if (HasNonNoneHitbox(ev))
-            {
-                return true;
-            }
-
-            object value;
-            if (eventData.TryGetValue("components", out value) && value != null && value.ToString().Trim().Length > 0)
-            {
-                return true;
-            }
-
-            if (eventData.TryGetValue("tag", out value) && value != null)
-            {
-                string tag = value.ToString();
-                if (tag.IndexOf("[attachToTile]", StringComparison.OrdinalIgnoreCase) >= 0
-                    || ContainsProtectedUiToken(tag))
-                {
-                    return true;
-                }
-            }
-
-            string[] protectedKeys =
-            {
-                "relativeTo",
-                "decorationImage",
-                "image",
-                "text",
-                "id"
-            };
-            for (int i = 0; i < protectedKeys.Length; i++)
-            {
-                if (eventData.TryGetValue(protectedKeys[i], out value)
-                    && value != null
-                    && ContainsProtectedUiToken(value.ToString()))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static bool ContainsProtectedUiToken(string value)
-        {
-            if (string.IsNullOrEmpty(value))
-            {
-                return false;
-            }
-
-            string normalized = value.ToLowerInvariant();
-            string[] tokens =
-            {
-                "camera",
-                "screen",
-                "ui",
-                "hud",
-                "judge",
-                "judgement",
-                "judgment",
-                "result",
-                "score",
-                "accuracy",
-                "timing",
-                "判定",
-                "结算",
-                "成绩"
-            };
-            for (int i = 0; i < tokens.Length; i++)
-            {
-                if (normalized.IndexOf(tokens[i], StringComparison.Ordinal) >= 0)
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static bool HasNonNoneHitbox(LevelEvent ev)
-        {
-            Dictionary<string, object> eventData = ev != null ? ev.GetData() : null;
-            object value;
-            if (eventData == null || !eventData.TryGetValue("hitbox", out value) || value == null)
-            {
-                return false;
-            }
-
-            try
-            {
-                return Convert.ToInt32(value) != (int)HitboxType.None;
-            }
-            catch
-            {
-                return value.ToString() != "None" && value.ToString() != "0";
-            }
-        }
-
-        private static void TrySetEventValue(LevelEvent ev, string key, object value)
-        {
-            Dictionary<string, object> eventData = ev != null ? ev.GetData() : null;
-            if (eventData == null)
-            {
-                return;
-            }
-
-            if (eventData.ContainsKey(key))
-            {
-                eventData[key] = value;
-            }
-        }
-
-        private static void AbortLoading(float elapsed)
-        {
-            abortingLoad = true;
-            loadingActive = false;
-            loadingDepth = 0;
-            string message = "Loading timeout after " + elapsed.ToString("0.0") + "s during " + loadingLabel + ". Returning to a safe scene.";
-            if (modEntry != null)
-            {
-                modEntry.Logger.Warning(message);
-            }
-
-            try
-            {
-                Time.timeScale = 1f;
-                AudioListener.pause = false;
-                if (ADOBase.isLevelEditor && ADOBase.editor != null && ADOBase.controller != null)
-                {
-                    ADOBase.editor.SwitchToEditMode(false);
-                    return;
-                }
-            }
-            catch (Exception ex)
-            {
-                if (modEntry != null)
-                {
-                    modEntry.Logger.LogException(ex);
-                }
-            }
-
-            try
-            {
-                SceneManager.LoadScene("scnCLS");
-            }
-            catch (Exception ex)
-            {
-                if (modEntry != null)
-                {
-                    modEntry.Logger.LogException(ex);
-                }
-            }
-        }
-
         private static void CaptureQualitySettings()
         {
             if (capturedQualitySettings)
@@ -919,8 +510,13 @@ namespace POMMax
 
             capturedQualitySettings = true;
             originalTargetFrameRate = Application.targetFrameRate;
+            originalRunInBackground = Application.runInBackground;
+            originalBackgroundLoadingPriority = Application.backgroundLoadingPriority;
             originalVSync = QualitySettings.vSyncCount;
             originalAntiAliasing = QualitySettings.antiAliasing;
+            originalAsyncUploadTimeSlice = QualitySettings.asyncUploadTimeSlice;
+            originalAsyncUploadBufferSize = QualitySettings.asyncUploadBufferSize;
+            originalAsyncUploadPersistentBuffer = QualitySettings.asyncUploadPersistentBuffer;
             originalAnisotropicFiltering = QualitySettings.anisotropicFiltering;
             originalPixelLightCount = QualitySettings.pixelLightCount;
             originalShadowDistance = QualitySettings.shadowDistance;
@@ -955,8 +551,6 @@ namespace POMMax
 
             try
             {
-                Application.runInBackground = true;
-                Application.backgroundLoadingPriority = UnityEngine.ThreadPriority.High;
                 if (settings.forceTargetFrameRate)
                 {
                     int target = Math.Max(30, settings.targetFps);
@@ -991,6 +585,15 @@ namespace POMMax
                     QualitySettings.softParticles = false;
                 }
 
+                int uploadBuffer = IsOverdriveMode() ? 64 : 32;
+                if (QualitySettings.asyncUploadBufferSize != uploadBuffer)
+                {
+                    QualitySettings.asyncUploadBufferSize = uploadBuffer;
+                }
+                QualitySettings.asyncUploadPersistentBuffer = true;
+                ApplyLoadingPolicy(loadingActive);
+                ConfigureTweenCapacity();
+
                 try
                 {
                     GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
@@ -1013,8 +616,13 @@ namespace POMMax
                 {
                     Application.targetFrameRate = originalTargetFrameRate;
                     RDUtils.targetFrameRate = originalTargetFrameRate;
+                    Application.runInBackground = originalRunInBackground;
+                    Application.backgroundLoadingPriority = originalBackgroundLoadingPriority;
                     QualitySettings.vSyncCount = originalVSync;
                     QualitySettings.antiAliasing = originalAntiAliasing;
+                    QualitySettings.asyncUploadTimeSlice = originalAsyncUploadTimeSlice;
+                    QualitySettings.asyncUploadBufferSize = originalAsyncUploadBufferSize;
+                    QualitySettings.asyncUploadPersistentBuffer = originalAsyncUploadPersistentBuffer;
                     QualitySettings.anisotropicFiltering = originalAnisotropicFiltering;
                     QualitySettings.pixelLightCount = originalPixelLightCount;
                     QualitySettings.shadowDistance = originalShadowDistance;
@@ -1034,12 +642,6 @@ namespace POMMax
                 }
 
                 SetThreadExecutionState(EsContinuous);
-                if (timerPeriodApplied)
-                {
-                    timeEndPeriod(1);
-                    timerPeriodApplied = false;
-                }
-                RestorePowerPlan();
             }
             catch
             {
@@ -1053,52 +655,18 @@ namespace POMMax
                 Process current = Process.GetCurrentProcess();
                 if (enable && modEnabled && settings != null && settings.boostGamePriority && EffectiveProfile() > ProfileOff)
                 {
-                    bool overdrive = IsOverdriveMode();
                     if (!capturedOwnPriority)
                     {
                         originalOwnPriority = current.PriorityClass;
                         capturedOwnPriority = true;
                     }
 
-                    ProcessPriorityClass desired = overdrive ? ProcessPriorityClass.High : ProcessPriorityClass.AboveNormal;
+                    // AboveNormal is enough to protect frame pacing without starving OBS,
+                    // audio services, Steam networking, or controller input threads.
+                    ProcessPriorityClass desired = ProcessPriorityClass.AboveNormal;
                     if (current.PriorityClass != desired)
                     {
                         current.PriorityClass = desired;
-                    }
-
-                    if (overdrive)
-                    {
-                        try
-                        {
-                            if (!capturedProcessorAffinity)
-                            {
-                                originalProcessorAffinity = current.ProcessorAffinity;
-                                capturedProcessorAffinity = true;
-                            }
-                            current.ProcessorAffinity = BuildAffinityMask();
-                        }
-                        catch
-                        {
-                        }
-
-                        TryApplyPowerPlan();
-                    }
-                    else
-                    {
-                        RestorePowerPlan();
-                    }
-
-                    try
-                    {
-                        System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
-                    }
-                    catch
-                    {
-                    }
-
-                    if (!timerPeriodApplied)
-                    {
-                        timerPeriodApplied = timeBeginPeriod(1) == 0;
                     }
                     if (settings.preventSleepDuringGameplay)
                     {
@@ -1111,205 +679,12 @@ namespace POMMax
                     {
                         current.PriorityClass = originalOwnPriority;
                     }
-                    if (capturedProcessorAffinity)
-                    {
-                        try
-                        {
-                            current.ProcessorAffinity = originalProcessorAffinity;
-                        }
-                        catch
-                        {
-                        }
-                        capturedProcessorAffinity = false;
-                    }
-                    RestorePowerPlan();
                     SetThreadExecutionState(EsContinuous);
-                    if (timerPeriodApplied)
-                    {
-                        timeEndPeriod(1);
-                        timerPeriodApplied = false;
-                    }
                 }
             }
             catch (Exception ex)
             {
                 Verbose("ApplyProcessBoost failed: " + ex.Message);
-            }
-        }
-
-        private static void ThrottleBackgroundProcesses()
-        {
-            Process current = null;
-            try
-            {
-                current = Process.GetCurrentProcess();
-            }
-            catch
-            {
-                return;
-            }
-
-            Process[] processes;
-            try
-            {
-                processes = Process.GetProcesses();
-            }
-            catch
-            {
-                return;
-            }
-
-            for (int i = 0; i < processes.Length; i++)
-            {
-                Process p = processes[i];
-                try
-                {
-                    if (p == null || p.Id == current.Id || p.SessionId != current.SessionId)
-                    {
-                        continue;
-                    }
-
-                    string name = p.ProcessName;
-                    if (protectedProcessNames.Contains(name))
-                    {
-                        continue;
-                    }
-
-                    if (!backgroundPriorities.ContainsKey(p.Id))
-                    {
-                        backgroundPriorities[p.Id] = p.PriorityClass;
-                    }
-
-                    ProcessPriorityClass desired = IsOverdriveMode() ? ProcessPriorityClass.Idle : ProcessPriorityClass.BelowNormal;
-                    if (p.PriorityClass != ProcessPriorityClass.Idle && p.PriorityClass != desired)
-                    {
-                        p.PriorityClass = desired;
-                    }
-                }
-                catch
-                {
-                }
-            }
-        }
-
-        private static void RestoreBackgroundPriorities()
-        {
-            foreach (KeyValuePair<int, ProcessPriorityClass> pair in new List<KeyValuePair<int, ProcessPriorityClass>>(backgroundPriorities))
-            {
-                try
-                {
-                    Process p = Process.GetProcessById(pair.Key);
-                    p.PriorityClass = pair.Value;
-                }
-                catch
-                {
-                }
-            }
-            backgroundPriorities.Clear();
-        }
-
-        private static IntPtr BuildAffinityMask()
-        {
-            int processors = Math.Max(1, Environment.ProcessorCount);
-            if (IntPtr.Size == 4)
-            {
-                int mask32 = processors >= 31 ? -1 : ((1 << processors) - 1);
-                return new IntPtr(mask32);
-            }
-
-            long mask64 = processors >= 63 ? -1L : ((1L << processors) - 1L);
-            return new IntPtr(mask64);
-        }
-
-        private static void TryApplyPowerPlan()
-        {
-            if (powerPlanApplied)
-            {
-                return;
-            }
-
-            if (!powerPlanCaptured)
-            {
-                string output;
-                int exitCode;
-                if (RunPowerCfg("/getactivescheme", out output, out exitCode) && exitCode == 0)
-                {
-                    Match match = Regex.Match(output ?? "", "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
-                    if (match.Success)
-                    {
-                        originalPowerSchemeGuid = match.Value;
-                    }
-                }
-                powerPlanCaptured = true;
-            }
-
-            string ignored;
-            int code;
-            if (RunPowerCfg("/setactive " + UltimatePerformanceScheme, out ignored, out code) && code == 0)
-            {
-                powerPlanApplied = true;
-                return;
-            }
-
-            if (RunPowerCfg("/setactive " + HighPerformanceScheme, out ignored, out code) && code == 0)
-            {
-                powerPlanApplied = true;
-            }
-        }
-
-        private static void RestorePowerPlan()
-        {
-            if (!powerPlanApplied || string.IsNullOrEmpty(originalPowerSchemeGuid))
-            {
-                powerPlanApplied = false;
-                return;
-            }
-
-            string ignored;
-            int code;
-            RunPowerCfg("/setactive " + originalPowerSchemeGuid, out ignored, out code);
-            powerPlanApplied = false;
-        }
-
-        private static bool RunPowerCfg(string arguments, out string output, out int exitCode)
-        {
-            output = "";
-            exitCode = -1;
-            try
-            {
-                ProcessStartInfo startInfo = new ProcessStartInfo();
-                startInfo.FileName = "powercfg.exe";
-                startInfo.Arguments = arguments;
-                startInfo.UseShellExecute = false;
-                startInfo.CreateNoWindow = true;
-                startInfo.RedirectStandardOutput = true;
-                startInfo.RedirectStandardError = true;
-                Process process = Process.Start(startInfo);
-                if (process == null)
-                {
-                    return false;
-                }
-
-                if (!process.WaitForExit(2500))
-                {
-                    try
-                    {
-                        process.Kill();
-                    }
-                    catch
-                    {
-                    }
-                    return false;
-                }
-
-                output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
-                exitCode = process.ExitCode;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Verbose("powercfg failed: " + ex.Message);
-                return false;
             }
         }
 
@@ -1342,6 +717,31 @@ namespace POMMax
             return value;
         }
 
+        private static void ConfigureTweenCapacity()
+        {
+            int tweeners = IsOverdriveMode() ? 4000 : 1500;
+            int sequences = IsOverdriveMode() ? 1000 : 400;
+            if (configuredTweenerCapacity >= tweeners && configuredSequenceCapacity >= sequences)
+            {
+                return;
+            }
+
+            try
+            {
+                DOTween.SetTweensCapacity(tweeners, sequences);
+                configuredTweenerCapacity = tweeners;
+                configuredSequenceCapacity = sequences;
+                if (modEntry != null)
+                {
+                    modEntry.Logger.Log("[TweenCapacity] Preallocated " + tweeners + " tweeners and " + sequences + " sequences.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Verbose("Tween capacity configuration was skipped: " + ex.Message);
+            }
+        }
+
         private static float Clamp(float value, float min, float max)
         {
             if (float.IsNaN(value) || float.IsInfinity(value))
@@ -1369,6 +769,28 @@ namespace POMMax
                 GUILayout.Height(32f)))
             {
                 settings.language = language;
+            }
+        }
+
+        private static void ApplyLoadingPolicy(bool loading)
+        {
+            if (!modEnabled || settings == null || EffectiveProfile() == ProfileOff)
+            {
+                return;
+            }
+
+            try
+            {
+                Application.backgroundLoadingPriority = loading
+                    ? UnityEngine.ThreadPriority.High
+                    : UnityEngine.ThreadPriority.Normal;
+                QualitySettings.asyncUploadTimeSlice = loading
+                    ? (IsOverdriveMode() ? 8 : 4)
+                    : 2;
+            }
+            catch (Exception ex)
+            {
+                Verbose("ApplyLoadingPolicy failed: " + ex.Message);
             }
         }
 
@@ -1435,7 +857,6 @@ namespace POMMax
 
             RestoreRuntimeDecorations();
             TextureOptimization.ResetSession(true);
-            RestoreBackgroundPriorities();
             ApplyProcessBoost(false);
             RestoreRuntimeSettings();
 
@@ -1486,15 +907,15 @@ namespace POMMax
             settings.disableVSync = true;
             settings.disableAntiAliasing = true;
             settings.disableCustomFrameRateEvents = true;
-            settings.skipPreloadCleanup = true;
-            settings.optimizeLevelEvents = true;
-            settings.disableBackgroundVideo = true;
-            settings.capDecorations = true;
-            settings.maxDecorations = 20000;
+            settings.skipPreloadCleanup = false;
+            settings.optimizeLevelEvents = false;
+            settings.disableBackgroundVideo = false;
+            settings.capDecorations = false;
+            settings.maxDecorations = 100000;
             settings.simplifyDecorationShaders = false;
             settings.throttleDecorationUpdates = false;
             settings.decorationUpdateStride = 2;
-            settings.enableLoadTimeout = true;
+            settings.enableLoadTimeout = false;
             settings.maxLoadSeconds = 45;
             settings.boostGamePriority = true;
             settings.preventSleepDuringGameplay = true;
@@ -1517,19 +938,19 @@ namespace POMMax
             settings.disableVSync = true;
             settings.disableAntiAliasing = true;
             settings.disableCustomFrameRateEvents = true;
-            settings.skipPreloadCleanup = true;
-            settings.optimizeLevelEvents = true;
-            settings.disableBackgroundVideo = true;
+            settings.skipPreloadCleanup = false;
+            settings.optimizeLevelEvents = false;
+            settings.disableBackgroundVideo = false;
             settings.capDecorations = false;
             settings.maxDecorations = 100000;
             settings.simplifyDecorationShaders = false;
             settings.throttleDecorationUpdates = false;
             settings.decorationUpdateStride = 1;
-            settings.enableLoadTimeout = true;
+            settings.enableLoadTimeout = false;
             settings.maxLoadSeconds = 45;
             settings.boostGamePriority = true;
             settings.preventSleepDuringGameplay = true;
-            settings.throttleBackgroundProcesses = true;
+            settings.throttleBackgroundProcesses = false;
             settings.verboseLogging = false;
             settings.optimizeCustomTextures = true;
             settings.textureScaleDivisor = 8f;
@@ -1574,10 +995,10 @@ namespace POMMax
         {
             return "Profile=" + (settings.overdriveMode ? "EXTREME" : settings.optimizationProfile >= ProfileMax ? "MAX" : "OFF")
                 + ", targetFps=" + settings.targetFps
-                + ", maxDecorations=" + settings.maxDecorations
-                + ", decorationStride=" + settings.decorationUpdateStride
                 + ", textureDivisor=" + settings.textureScaleDivisor.ToString("0.##", CultureInfo.InvariantCulture)
-                + ", textureCompression=" + settings.compressCustomTextures
+                + ", asyncUploadBufferMB=" + (settings.overdriveMode ? 64 : 32)
+                + ", tweenCapacity=" + (settings.overdriveMode ? 4000 : 1500)
+                + ", chartDataPreserved=true"
                 + ".";
         }
 
@@ -1652,11 +1073,11 @@ namespace POMMax
                 case "profileMax": return "MAX";
                 case "profileExtreme": return "EXTREME";
                 case "profileOffDescription": return "Disables all optimization and restores the captured game settings.";
-                case "profileMaxDescription": return "Stable strong optimization with balanced visuals and performance.";
-                case "profileExtremeDescription": return "Maximum performance with alpha-safe large-texture reduction and intact dynamic decorations.";
+                case "profileMaxDescription": return "Stable frame pacing and faster custom-texture loading without changing chart events or decorations.";
+                case "profileExtremeDescription": return "Maximum safe runtime tuning with stronger texture limits and preallocated effect capacity.";
                 case "profileOffConfiguration": return "Use this profile for compatibility checks.";
-                case "profileMaxConfiguration": return "2x texture downsampling and high-cost event reduction; runtime decorations remain intact.";
-                case "profileExtremeConfiguration": return "8x large-texture downsampling with a 32px safety floor; linked decorations and motion events remain intact.";
+                case "profileMaxConfiguration": return "2x large-texture limit, 32 MB async upload buffer, 1,500 preallocated tweens; all chart data remains intact.";
+                case "profileExtremeConfiguration": return "8x large-texture limit with a 32px safety floor, 64 MB upload buffer and 4,000 preallocated tweens.";
                 case "profileApplyNote": return "Runtime changes apply now. Level optimization refreshes on the next load.";
                 case "latestResult": return "Latest level optimization";
                 case "runtime": return "Runtime frame pacing";
@@ -1691,7 +1112,7 @@ namespace POMMax
                 case "backgroundThrottle": return "Lower priority of other user-session processes";
                 case "verbose": return "Verbose log optimization details";
                 case "range": return "Range: ";
-                case "note": return "MAX/OVERDRIVE may reduce visual effects. Editor scene level data is not optimized to avoid saving reduced maps.";
+                case "note": return "Chart events and decorations are never deleted. If another texture optimizer is active, POM-Max disables only its texture module.";
                 case "docsLink": return "Open usage guide";
                 case "sourceLink": return "Open source code";
                 default: return key;
@@ -1709,11 +1130,11 @@ namespace POMMax
                 case "profileMax": return "MAX";
                 case "profileExtreme": return "极限性能";
                 case "profileOffDescription": return "停用全部优化，并恢复已捕获的游戏设置。";
-                case "profileMaxDescription": return "稳定强优化，兼顾画面表现与性能。";
-                case "profileExtremeDescription": return "以稳定为前提追求极限性能，安全缩减大纹理并保留动态装饰。";
+                case "profileMaxDescription": return "稳定改善帧时间与自定义纹理加载，不改动谱面事件和装饰物。";
+                case "profileExtremeDescription": return "在保留谱面逻辑的前提下启用更强纹理限制与特效容量预分配。";
                 case "profileOffConfiguration": return "适合排查兼容性问题。";
-                case "profileMaxConfiguration": return "纹理降采样 2 倍并削减高开销事件；不裁剪运行时装饰。";
-                case "profileExtremeConfiguration": return "大纹理最多降采样 8 倍并保留 32 像素安全下限；动态装饰与移动事件完整保留。";
+                case "profileMaxConfiguration": return "大纹理限制为 2 倍、异步上传缓冲 32 MB、预分配 1500 个 Tween；谱面数据完整保留。";
+                case "profileExtremeConfiguration": return "大纹理最多限制 8 倍并保留 32 像素短边、上传缓冲 64 MB、预分配 4000 个 Tween。";
                 case "profileApplyNote": return "运行设置立即生效；谱面优化在下次加载时刷新。";
                 case "latestResult": return "最近一次谱面优化";
                 case "runtime": return "运行帧率策略";
@@ -1748,7 +1169,7 @@ namespace POMMax
                 case "backgroundThrottle": return "降低同一用户会话中其他进程优先级";
                 case "verbose": return "记录详细优化日志";
                 case "range": return "范围: ";
-                case "note": return "MAX/OVERDRIVE 可能减少视觉特效。编辑器场景不会优化谱面数据，避免保存成被削减的谱面。";
+                case "note": return "不会删除谱面事件或装饰物；检测到其他纹理优化器时，仅自动停用本模组的纹理模块。";
                 case "docsLink": return "打开使用说明";
                 case "sourceLink": return "打开源代码";
                 default: return key;
@@ -1766,11 +1187,11 @@ namespace POMMax
                 case "profileMax": return "MAX";
                 case "profileExtreme": return "EXTREME";
                 case "profileOffDescription": return "모든 최적화를 끄고 캡처된 게임 설정을 복원합니다.";
-                case "profileMaxDescription": return "화면 호환성과 성능을 균형 있게 유지하는 안정적인 강한 최적화입니다.";
-                case "profileExtremeDescription": return "알파 안전 대형 텍스처 축소와 동적 장식 보존을 적용한 최고 성능 프로필입니다.";
+                case "profileMaxDescription": return "차트 이벤트와 장식을 변경하지 않고 프레임 페이싱과 커스텀 텍스처 로딩을 개선합니다.";
+                case "profileExtremeDescription": return "차트 로직을 유지하면서 더 강한 텍스처 제한과 이펙트 용량 사전 할당을 적용합니다.";
                 case "profileOffConfiguration": return "호환성 문제를 확인할 때 사용합니다.";
-                case "profileMaxConfiguration": return "텍스처 2배 다운샘플링 및 고비용 이벤트 축소; 런타임 장식은 유지합니다.";
-                case "profileExtremeConfiguration": return "대형 텍스처는 최대 8배로 축소하고 32픽셀 안전 하한, 동적 장식과 이동 이벤트를 유지합니다.";
+                case "profileMaxConfiguration": return "대형 텍스처 2배 제한, 32 MB 업로드 버퍼, Tween 1,500개 사전 할당; 차트 데이터는 유지됩니다.";
+                case "profileExtremeConfiguration": return "대형 텍스처 최대 8배 및 32픽셀 하한, 64 MB 업로드 버퍼, Tween 4,000개 사전 할당.";
                 case "profileApplyNote": return "런타임 설정은 즉시 적용되며 레벨 최적화는 다음 로드에서 갱신됩니다.";
                 case "latestResult": return "최근 레벨 최적화";
                 case "runtime": return "런타임 프레임 설정";
@@ -1805,7 +1226,7 @@ namespace POMMax
                 case "backgroundThrottle": return "같은 사용자 세션의 다른 프로세스 우선순위 낮춤";
                 case "verbose": return "자세한 최적화 로그";
                 case "range": return "범위: ";
-                case "note": return "MAX/OVERDRIVE는 시각 효과를 줄일 수 있습니다. 저장 손상을 막기 위해 에디터 장면의 데이터는 최적화하지 않습니다.";
+                case "note": return "차트 이벤트와 장식을 삭제하지 않습니다. 다른 텍스처 최적화가 감지되면 POM-Max 텍스처 모듈만 비활성화됩니다.";
                 case "docsLink": return "사용 설명 열기";
                 case "sourceLink": return "소스 코드 열기";
                 default: return key;
@@ -2160,6 +1581,18 @@ namespace POMMax
 
     public static class TextureOptimization
     {
+        public sealed class TextureLoadState
+        {
+            public bool eligible;
+            public bool pomApplied;
+            public string filePath;
+            public int originalWidth;
+            public int originalHeight;
+            public int requestedMaxSide;
+        }
+
+        private const int TextureFailureLimit = 3;
+
         private sealed class BackgroundScaleState
         {
             public int textureId;
@@ -2210,138 +1643,233 @@ namespace POMMax
         private static long measuredAfterBytes;
         private static bool reported;
         private static bool notificationPending;
-        private static bool legacyWarningLogged;
+        private static bool compatibilityKnown;
+        private static bool textureConflict;
+        private static string textureConflictOwner = "";
+        private static bool textureModuleDisabled;
+        private static int consecutiveTextureFailures;
         private static string lastReport = "";
         private static string currentLoadPath = "";
         private static string lastReportedLoadPath = "";
         private static float lastReportedAt = -1000f;
-        private static bool levelDataRecorded;
         private static bool editorLevelDataSkipped;
         private static int levelEventsBefore;
-        private static int levelEventsAfter;
         private static int levelDecorationsBefore;
-        private static int levelDecorationsAfter;
-        private static int runtimeDecorationsSeen;
-        private static int runtimeDecorationsOptimized;
-        private static int runtimeDecorationsProtected;
-        private static int runtimeDecorationsRemaining;
         private static float loadingDuration;
         private static float reportFallbackAt = -1f;
 
-        public static void ProcessTexture(ref Texture2D texture, string filePath)
+        public static TextureLoadState PrepareTextureLoad(string filePath, ref int maxSideSize)
         {
+            TextureLoadState state = new TextureLoadState();
+            state.filePath = filePath ?? "";
+
             if (!ShouldOptimize()
-                || !ShouldOptimizePath(filePath)
-                || texture == null
-                || texture.width <= 0
-                || texture.height <= 0)
+                || !ShouldOptimizePath(filePath))
             {
-                return;
+                return state;
             }
 
-            if (HasLegacyOptimizerPatch())
+            if (!compatibilityKnown)
+            {
+                RefreshCompatibilityState(false);
+            }
+
+            if (textureConflict || textureModuleDisabled)
             {
                 skippedCount++;
-                if (!legacyWarningLogged && Main.modEntry != null)
+                return state;
+            }
+
+            try
+            {
+                int originalWidth;
+                int originalHeight;
+                if (!TryReadImageDimensions(filePath, out originalWidth, out originalHeight))
                 {
-                    legacyWarningLogged = true;
-                    Main.modEntry.Logger.Warning(
-                        "[TextureOptimizer] Legacy optimiz patch detected. POM-Max skipped texture processing to prevent double compression.");
+                    skippedCount++;
+                    return state;
                 }
+
+                state.eligible = true;
+                state.originalWidth = originalWidth;
+                state.originalHeight = originalHeight;
+
+                float divisor = Mathf.Max(1f, Main.settings.textureScaleDivisor);
+                if (divisor <= 1f)
+                {
+                    skippedCount++;
+                    return state;
+                }
+
+                int maximumSide = Math.Max(originalWidth, originalHeight);
+                int minimumSide = Math.Min(originalWidth, originalHeight);
+                float scale = 1f / divisor;
+                if (minimumSide > 0 && minimumSide * scale < 32f)
+                {
+                    scale = Math.Min(1f, 32f / minimumSide);
+                }
+
+                int targetMaximumSide = Math.Max(4, Mathf.RoundToInt(maximumSide * scale));
+                if (Main.settings.roundTextureDimensionsToMultipleOf4 && targetMaximumSide >= 4)
+                {
+                    targetMaximumSide = Math.Min(maximumSide, NearestMultipleOf4(targetMaximumSide));
+                }
+
+                if (targetMaximumSide >= maximumSide)
+                {
+                    skippedCount++;
+                    return state;
+                }
+
+                if (maxSideSize < 0 || targetMaximumSide < maxSideSize)
+                {
+                    maxSideSize = targetMaximumSide;
+                    state.pomApplied = true;
+                    state.requestedMaxSide = targetMaximumSide;
+                }
+                else
+                {
+                    skippedCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                HandleTextureLoadFailure(state, ex);
+            }
+
+            return state;
+        }
+
+        public static void ProcessTexture(Texture2D texture, TextureLoadState state)
+        {
+            if (state == null || !state.eligible || texture == null || texture.width <= 0 || texture.height <= 0)
+            {
                 return;
             }
 
-            int originalId = texture.GetInstanceID();
-            if (processedTextureIds.Contains(originalId))
+            int textureId = texture.GetInstanceID();
+            if (!processedTextureIds.Add(textureId))
             {
                 duplicateCount++;
                 return;
             }
 
             loadedCount++;
-            Texture2D original = texture;
-            Texture2D candidate = original;
-            bool replacementCreated = false;
-            int originalWidth = original.width;
-            int originalHeight = original.height;
-            long beforeBytes = MeasureTextureBytes(original);
+            consecutiveTextureFailures = 0;
+            long beforeBytes = Math.Max(0L, (long)state.originalWidth * state.originalHeight * 4L);
+            long afterBytes = MeasureTextureBytes(texture);
 
-            try
+            if (state.pomApplied && (texture.width < state.originalWidth || texture.height < state.originalHeight))
             {
-                float divisor = Mathf.Max(1f, Main.settings.textureScaleDivisor);
-                int targetWidth = Math.Max(
-                    Math.Min(originalWidth, 32),
-                    Mathf.RoundToInt(originalWidth / divisor));
-                int targetHeight = Math.Max(
-                    Math.Min(originalHeight, 32),
-                    Mathf.RoundToInt(originalHeight / divisor));
-
-                if (targetWidth >= 4 && targetHeight >= 4 && Main.settings.roundTextureDimensionsToMultipleOf4)
-                {
-                    targetWidth = Math.Min(originalWidth, NearestMultipleOf4(targetWidth));
-                    targetHeight = Math.Min(originalHeight, NearestMultipleOf4(targetHeight));
-                }
-                else if (targetWidth < 4 || targetHeight < 4)
-                {
-                    targetWidth = originalWidth;
-                    targetHeight = originalHeight;
-                }
-
-                bool resize = targetWidth != originalWidth || targetHeight != originalHeight;
-                if (resize)
-                {
-                    candidate = CreateReadableTexture(original, targetWidth, targetHeight);
-                    replacementCreated = true;
-                }
-
-                if (replacementCreated)
-                {
-                    candidate.Apply(false, true);
-                }
-
-                if (resize)
-                {
-                    resizedCount++;
-                }
-                else
-                {
-                    skippedCount++;
-                }
-
-                Vector3 ratio = new Vector3(
-                    (float)originalWidth / candidate.width,
-                    (float)originalHeight / candidate.height,
+                resizedCount++;
+                textureRatios[textureId] = new Vector3(
+                    (float)state.originalWidth / texture.width,
+                    (float)state.originalHeight / texture.height,
                     1f);
-
-                texture = candidate;
-                int candidateId = candidate.GetInstanceID();
-                textureRatios[candidateId] = ratio;
-                processedTextureIds.Add(originalId);
-                processedTextureIds.Add(candidateId);
-
-                long afterBytes = MeasureTextureBytes(candidate);
-                measuredBeforeBytes += Math.Max(0L, beforeBytes);
+                measuredBeforeBytes += beforeBytes;
                 measuredAfterBytes += Math.Max(0L, afterBytes);
-
-                if (replacementCreated && original != candidate)
-                {
-                    UnityEngine.Object.Destroy(original);
-                }
             }
-            catch (Exception ex)
+            else
             {
-                errorCount++;
-                if (replacementCreated && candidate != null && candidate != original)
-                {
-                    UnityEngine.Object.Destroy(candidate);
-                }
-                texture = original;
-                processedTextureIds.Add(originalId);
-                textureRatios[originalId] = Vector3.one;
+                skippedCount++;
+                textureRatios[textureId] = Vector3.one;
+            }
+        }
+
+        public static void HandleTextureLoadFailure(TextureLoadState state, Exception exception)
+        {
+            if (state == null || !state.eligible || exception == null)
+            {
+                return;
+            }
+
+            errorCount++;
+            consecutiveTextureFailures++;
+            if (Main.modEntry != null)
+            {
+                Main.modEntry.Logger.Warning("[TextureOptimizer] Pre-limit failed for " + (string.IsNullOrEmpty(state.filePath) ? "<unknown>" : state.filePath));
+                Main.modEntry.Logger.LogException(exception);
+            }
+
+            if (consecutiveTextureFailures >= TextureFailureLimit && !textureModuleDisabled)
+            {
+                textureModuleDisabled = true;
                 if (Main.modEntry != null)
                 {
-                    Main.modEntry.Logger.Warning("[TextureOptimizer] Failed to optimize " + SafeTextureLabel(original, filePath));
-                    Main.modEntry.Logger.LogException(ex);
+                    Main.modEntry.Logger.Error("[TextureOptimizer] Disabled for this session after repeated failures. Original game loading remains active.");
+                }
+            }
+        }
+
+        public static void RefreshCompatibilityState(bool force)
+        {
+            if (compatibilityKnown && !force)
+            {
+                return;
+            }
+
+            compatibilityKnown = true;
+            textureConflict = false;
+            textureConflictOwner = "";
+
+            MethodInfo target = AccessTools.Method(
+                typeof(TextureManager),
+                "LoadTexture",
+                new Type[] { typeof(string), typeof(LoadResult).MakeByRefType(), typeof(int) });
+            HarmonyLib.Patches patchInfo = target != null ? Harmony.GetPatchInfo(target) : null;
+            if (patchInfo != null)
+            {
+                FindTextureConflict(patchInfo.Prefixes);
+                FindTextureConflict(patchInfo.Postfixes);
+                FindTextureConflict(patchInfo.Transpilers);
+                FindTextureConflict(patchInfo.Finalizers);
+            }
+
+            if (textureConflict)
+            {
+                if (Main.modEntry != null)
+                {
+                    Main.modEntry.Logger.Warning(
+                        "[TextureOptimizer] Another texture optimizer owns TextureManager.LoadTexture ("
+                        + textureConflictOwner
+                        + "). POM-Max texture scaling is disabled to prevent double processing.");
+                }
+                return;
+            }
+
+            if (force)
+            {
+                textureModuleDisabled = false;
+                consecutiveTextureFailures = 0;
+            }
+        }
+
+        private static void FindTextureConflict(IEnumerable<Patch> patches)
+        {
+            if (textureConflict || patches == null)
+            {
+                return;
+            }
+
+            string ownId = Main.modEntry != null ? Main.modEntry.Info.Id : "POMMax";
+            foreach (Patch patch in patches)
+            {
+                string owner = patch.owner ?? "";
+                Type declaringType = patch.PatchMethod != null ? patch.PatchMethod.DeclaringType : null;
+                string typeName = declaringType != null ? declaringType.FullName ?? "" : "";
+                if (string.Equals(owner, ownId, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (owner.IndexOf("optimiz", StringComparison.OrdinalIgnoreCase) >= 0
+                    || owner.IndexOf("iridium", StringComparison.OrdinalIgnoreCase) >= 0
+                    || typeName.StartsWith("SANSMASTER.", StringComparison.Ordinal)
+                    || typeName.IndexOf("Iridium", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    textureConflict = true;
+                    textureConflictOwner = string.IsNullOrEmpty(owner) ? typeName : owner;
+                    return;
                 }
             }
         }
@@ -2611,16 +2139,9 @@ namespace POMMax
             reported = false;
             notificationPending = false;
             lastReport = "";
-            levelDataRecorded = false;
             editorLevelDataSkipped = false;
             levelEventsBefore = 0;
-            levelEventsAfter = 0;
             levelDecorationsBefore = 0;
-            levelDecorationsAfter = 0;
-            runtimeDecorationsSeen = 0;
-            runtimeDecorationsOptimized = 0;
-            runtimeDecorationsProtected = 0;
-            runtimeDecorationsRemaining = 0;
             loadingDuration = 0f;
             reportFallbackAt = -1f;
             currentLoadPath = "";
@@ -2664,20 +2185,9 @@ namespace POMMax
             int decorationsAfter,
             bool skippedInEditor)
         {
-            levelDataRecorded = true;
             editorLevelDataSkipped = skippedInEditor;
             levelEventsBefore = Math.Max(0, eventsBefore);
-            levelEventsAfter = Math.Max(0, eventsAfter);
             levelDecorationsBefore = Math.Max(0, decorationsBefore);
-            levelDecorationsAfter = Math.Max(0, decorationsAfter);
-        }
-
-        public static void RecordRuntimeDecorations(int seen, int optimized, int protectedCount, int remaining)
-        {
-            runtimeDecorationsSeen = Math.Max(0, seen);
-            runtimeDecorationsOptimized = Math.Max(0, optimized);
-            runtimeDecorationsProtected = Math.Max(0, protectedCount);
-            runtimeDecorationsRemaining = Math.Max(0, remaining);
         }
 
         public static void RecordLoadingDuration(float seconds)
@@ -2852,59 +2362,140 @@ namespace POMMax
             return ShouldOptimize() && Main.settings.adjustTextureGeometry;
         }
 
-        private static bool HasLegacyOptimizerPatch()
+        private static bool TryReadImageDimensions(string filePath, out int width, out int height)
         {
-            MethodInfo target = AccessTools.Method(typeof(TextureManager), "LoadTexture");
-            HarmonyLib.Patches patchInfo = target != null ? Harmony.GetPatchInfo(target) : null;
-            if (patchInfo == null)
+            width = 0;
+            height = 0;
+            try
             {
-                return false;
-            }
-
-            foreach (Patch patch in patchInfo.Postfixes)
-            {
-                string owner = patch.owner ?? "";
-                Type declaringType = patch.PatchMethod != null ? patch.PatchMethod.DeclaringType : null;
-                string typeName = declaringType != null ? declaringType.FullName : "";
-                if (!string.Equals(owner, Main.modEntry != null ? Main.modEntry.Info.Id : "POMMax", StringComparison.Ordinal)
-                    && (owner.IndexOf("optimiz", StringComparison.OrdinalIgnoreCase) >= 0
-                        || typeName.StartsWith("SANSMASTER.", StringComparison.Ordinal)))
+                string extension = Path.GetExtension(filePath);
+                using (FileStream stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 {
-                    return true;
+                    if (string.Equals(extension, ".png", StringComparison.OrdinalIgnoreCase))
+                    {
+                        byte[] header = new byte[24];
+                        if (stream.Read(header, 0, header.Length) != header.Length
+                            || header[0] != 0x89
+                            || header[1] != 0x50
+                            || header[2] != 0x4E
+                            || header[3] != 0x47
+                            || header[12] != 0x49
+                            || header[13] != 0x48
+                            || header[14] != 0x44
+                            || header[15] != 0x52)
+                        {
+                            return false;
+                        }
+
+                        width = ReadBigEndianInt32(header, 16);
+                        height = ReadBigEndianInt32(header, 20);
+                        return IsValidImageSize(width, height);
+                    }
+
+                    if (!string.Equals(extension, ".jpg", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(extension, ".jpeg", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+
+                    if (stream.ReadByte() != 0xFF || stream.ReadByte() != 0xD8)
+                    {
+                        return false;
+                    }
+
+                    while (stream.Position < stream.Length)
+                    {
+                        int markerPrefix = stream.ReadByte();
+                        while (markerPrefix != 0xFF && markerPrefix >= 0)
+                        {
+                            markerPrefix = stream.ReadByte();
+                        }
+                        if (markerPrefix < 0)
+                        {
+                            break;
+                        }
+
+                        int marker = stream.ReadByte();
+                        while (marker == 0xFF)
+                        {
+                            marker = stream.ReadByte();
+                        }
+                        if (marker < 0 || marker == 0xD9 || marker == 0xDA)
+                        {
+                            break;
+                        }
+                        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
+                        {
+                            continue;
+                        }
+
+                        int segmentLength = ReadBigEndianUInt16(stream);
+                        if (segmentLength < 2)
+                        {
+                            return false;
+                        }
+
+                        if (IsJpegStartOfFrame(marker))
+                        {
+                            if (segmentLength < 7 || stream.ReadByte() < 0)
+                            {
+                                return false;
+                            }
+                            height = ReadBigEndianUInt16(stream);
+                            width = ReadBigEndianUInt16(stream);
+                            return IsValidImageSize(width, height);
+                        }
+
+                        long next = stream.Position + segmentLength - 2L;
+                        if (next < stream.Position || next > stream.Length)
+                        {
+                            return false;
+                        }
+                        stream.Position = next;
+                    }
                 }
+            }
+            catch
+            {
             }
             return false;
         }
 
-        private static Texture2D CreateReadableTexture(Texture2D source, int width, int height)
+        private static int ReadBigEndianInt32(byte[] value, int offset)
         {
-            RenderTexture previous = RenderTexture.active;
-            RenderTexture temporary = RenderTexture.GetTemporary(
-                width,
-                height,
-                0,
-                RenderTextureFormat.ARGB32,
-                RenderTextureReadWrite.sRGB);
-            try
-            {
-                temporary.filterMode = source.filterMode;
-                temporary.wrapMode = source.wrapMode;
-                Graphics.Blit(source, temporary);
-                RenderTexture.active = temporary;
-                Texture2D result = new Texture2D(width, height, TextureFormat.RGBA32, false, false);
-                result.name = source.name;
-                result.filterMode = source.filterMode;
-                result.wrapMode = source.wrapMode;
-                result.anisoLevel = source.anisoLevel;
-                result.ReadPixels(new Rect(0f, 0f, width, height), 0, 0);
-                result.Apply(false, false);
-                return result;
-            }
-            finally
-            {
-                RenderTexture.active = previous;
-                RenderTexture.ReleaseTemporary(temporary);
-            }
+            return (value[offset] << 24)
+                | (value[offset + 1] << 16)
+                | (value[offset + 2] << 8)
+                | value[offset + 3];
+        }
+
+        private static int ReadBigEndianUInt16(Stream stream)
+        {
+            int high = stream.ReadByte();
+            int low = stream.ReadByte();
+            return high < 0 || low < 0 ? -1 : (high << 8) | low;
+        }
+
+        private static bool IsValidImageSize(int width, int height)
+        {
+            return width > 0 && height > 0 && width <= 131072 && height <= 131072;
+        }
+
+        private static bool IsJpegStartOfFrame(int marker)
+        {
+            return marker == 0xC0
+                || marker == 0xC1
+                || marker == 0xC2
+                || marker == 0xC3
+                || marker == 0xC5
+                || marker == 0xC6
+                || marker == 0xC7
+                || marker == 0xC9
+                || marker == 0xCA
+                || marker == 0xCB
+                || marker == 0xCD
+                || marker == 0xCE
+                || marker == 0xCF;
         }
 
         private static long MeasureTextureBytes(Texture2D texture)
@@ -2977,13 +2568,8 @@ namespace POMMax
 
         private static string BuildReport(long reduction)
         {
-            return "workloadReduction=" + FormatPercent(GetWorkloadReductionRatio())
-                + ", events=" + levelEventsBefore + " -> " + levelEventsAfter
-                + " (removed " + GetRemovedEvents() + ")"
-                + ", levelDecorations=" + levelDecorationsBefore + " -> " + levelDecorationsAfter
-                + " (removed " + GetRemovedLevelDecorations() + ")"
-                + ", runtimeDecorations=" + runtimeDecorationsSeen + " -> " + runtimeDecorationsRemaining
-                + " (optimized " + runtimeDecorationsOptimized + ", protected " + runtimeDecorationsProtected + ")"
+            return "chartEventsPreserved=" + levelEventsBefore
+                + ", levelDecorationsPreserved=" + levelDecorationsBefore
                 + ", editorDataPreserved=" + editorLevelDataSkipped
                 + ", texturesLoaded=" + loadedCount
                 + ", resized=" + resizedCount
@@ -3020,28 +2606,23 @@ namespace POMMax
 
         private static string BuildSummary(int language, bool multiline)
         {
-            string workload = FormatPercent(GetWorkloadReductionRatio());
             string textureRatio = FormatPercent(GetTextureReductionRatio());
             string amount = FormatMegabytes(Math.Max(0L, measuredBeforeBytes - measuredAfterBytes));
-            int removedEvents = GetRemovedEvents();
-            int optimizedDecorations = GetRemovedLevelDecorations() + runtimeDecorationsOptimized;
+            int uploadBuffer = Main.IsOverdriveMode() ? 64 : 32;
+            int tweenCapacity = Main.IsOverdriveMode() ? 4000 : 1500;
 
             if (language == 0)
             {
                 if (multiline)
                 {
-                    return "负载优化比 " + workload
-                        + "  ·  事件精简 " + removedEvents
-                        + "  ·  装饰精简 " + optimizedDecorations
-                        + "\n纹理 " + loadedCount + " 张  ·  节省 " + amount + " MB"
-                        + "  ·  纹理优化比 " + textureRatio
+                    return "谱面事件与装饰完整保留  ·  纹理 " + resizedCount + "/" + loadedCount + " 张已限制"
+                        + "  ·  节省 " + amount + " MB  ·  优化比 " + textureRatio
+                        + "\n上传缓冲 " + uploadBuffer + " MB  ·  Tween 容量 " + tweenCapacity
                         + "  ·  加载 " + loadingDuration.ToString("0.00", CultureInfo.InvariantCulture) + " 秒";
                 }
-                return "优化完成｜负载优化比 " + workload
-                    + "｜事件 " + removedEvents
-                    + "｜装饰 " + optimizedDecorations
-                    + "\n纹理节省 " + amount + " MB"
-                    + "｜纹理优化比 " + textureRatio
+                return "优化完成｜谱面数据完整保留｜纹理 " + resizedCount + "/" + loadedCount
+                    + "\n节省 " + amount + " MB｜优化比 " + textureRatio
+                    + "｜上传 " + uploadBuffer + " MB"
                     + "｜加载 " + loadingDuration.ToString("0.00", CultureInfo.InvariantCulture) + " 秒";
             }
 
@@ -3049,61 +2630,28 @@ namespace POMMax
             {
                 if (multiline)
                 {
-                    return "부하 최적화 " + workload
-                        + "  ·  이벤트 " + removedEvents
-                        + "  ·  장식 " + optimizedDecorations
-                        + "\n텍스처 " + loadedCount + "개  ·  " + amount + " MB 절감"
-                        + "  ·  텍스처 최적화 " + textureRatio
+                    return "차트 이벤트와 장식 보존  ·  텍스처 " + resizedCount + "/" + loadedCount + "개 제한"
+                        + "  ·  " + amount + " MB 절감  ·  최적화 " + textureRatio
+                        + "\n업로드 버퍼 " + uploadBuffer + " MB  ·  Tween 용량 " + tweenCapacity
                         + "  ·  로드 " + loadingDuration.ToString("0.00", CultureInfo.InvariantCulture) + "초";
                 }
-                return "최적화 완료 | 부하 감소 " + workload
-                    + " | 이벤트 " + removedEvents
-                    + " | 장식 " + optimizedDecorations
-                    + "\n텍스처 " + amount + " MB 절감"
-                    + " | 감소율 " + textureRatio
+                return "최적화 완료 | 차트 데이터 보존 | 텍스처 " + resizedCount + "/" + loadedCount
+                    + "\n" + amount + " MB 절감 | 최적화 " + textureRatio
+                    + " | 업로드 " + uploadBuffer + " MB"
                     + " | 로드 " + loadingDuration.ToString("0.00", CultureInfo.InvariantCulture) + "초";
             }
 
             if (multiline)
             {
-                return "Workload reduction " + workload
-                    + "  ·  events " + removedEvents
-                    + "  ·  decorations " + optimizedDecorations
-                    + "\nTextures " + loadedCount + "  ·  saved " + amount + " MB"
-                    + "  ·  texture reduction " + textureRatio
+                return "Chart events and decorations preserved  ·  textures " + resizedCount + "/" + loadedCount + " limited"
+                    + "  ·  saved " + amount + " MB  ·  reduction " + textureRatio
+                    + "\nUpload buffer " + uploadBuffer + " MB  ·  tween capacity " + tweenCapacity
                     + "  ·  load " + loadingDuration.ToString("0.00", CultureInfo.InvariantCulture) + " s";
             }
-            return "Optimized | workload reduction " + workload
-                + " | events " + removedEvents
-                + " | decorations " + optimizedDecorations
-                + "\nTextures saved " + amount + " MB"
-                + " | reduction " + textureRatio
+            return "Optimized | chart data preserved | textures " + resizedCount + "/" + loadedCount
+                + "\nSaved " + amount + " MB | reduction " + textureRatio
+                + " | upload " + uploadBuffer + " MB"
                 + " | load " + loadingDuration.ToString("0.00", CultureInfo.InvariantCulture) + " s";
-        }
-
-        private static int GetRemovedEvents()
-        {
-            return Math.Max(0, levelEventsBefore - levelEventsAfter);
-        }
-
-        private static int GetRemovedLevelDecorations()
-        {
-            return Math.Max(0, levelDecorationsBefore - levelDecorationsAfter);
-        }
-
-        private static double GetWorkloadReductionRatio()
-        {
-            int decorationBase = levelDataRecorded
-                ? Math.Max(levelDecorationsBefore, runtimeDecorationsSeen + GetRemovedLevelDecorations())
-                : runtimeDecorationsSeen;
-            int workloadBase = Math.Max(0, levelEventsBefore) + Math.Max(0, decorationBase);
-            if (workloadBase <= 0)
-            {
-                return 0d;
-            }
-
-            int reduced = GetRemovedEvents() + GetRemovedLevelDecorations() + runtimeDecorationsOptimized;
-            return Math.Min(100d, Math.Max(0d, reduced * 100d / workloadBase));
         }
 
         private static double GetTextureReductionRatio()
@@ -3132,9 +2680,72 @@ namespace POMMax
         }
     }
 
-    [HarmonyPatch(typeof(LevelData), "Decode")]
+    public static class CompatibilityDiagnostics
+    {
+        public static void Report()
+        {
+            if (Main.modEntry == null)
+            {
+                return;
+            }
+
+            int missing = 0;
+            missing += Check(
+                typeof(LevelData),
+                "Decode",
+                new Type[] { typeof(Dictionary<string, object>), typeof(LoadResult).MakeByRefType() });
+            missing += Check(typeof(scnGame), "LoadAndPlayLevel", new Type[] { typeof(string) });
+            missing += Check(
+                typeof(scnGame),
+                "LoadLevel",
+                new Type[] { typeof(string), typeof(LoadResult).MakeByRefType() });
+            missing += Check(typeof(scnGame), "ReloadAssets", new Type[] { typeof(bool), typeof(bool) });
+            missing += Check(typeof(scnGame), "ResetScene", new Type[] { typeof(bool) });
+            missing += Check(typeof(scrController), "ResetCustomLevel", new Type[] { typeof(bool) });
+            missing += Check(
+                typeof(TextureManager),
+                "LoadTexture",
+                new Type[] { typeof(string), typeof(LoadResult).MakeByRefType(), typeof(int) });
+            missing += Check(typeof(scnGame), "UpdateDecorationObjects", new Type[] { typeof(bool) });
+
+            if (missing == 0)
+            {
+                Main.modEntry.Logger.Log(
+                    "[Compatibility] Game " + Application.version + ": all required supported method signatures were verified.");
+            }
+            else
+            {
+                Main.modEntry.Logger.Warning(
+                    "[Compatibility] Game " + Application.version + ": " + missing
+                    + " required method signature(s) are unavailable. Affected optional patches were skipped or will remain inactive.");
+            }
+        }
+
+        private static int Check(Type type, string methodName, Type[] argumentTypes)
+        {
+            MethodInfo method = AccessTools.Method(type, methodName, argumentTypes);
+            if (method != null)
+            {
+                return 0;
+            }
+
+            Main.modEntry.Logger.Warning(
+                "[Compatibility] Missing method: " + type.FullName + "." + methodName + ".");
+            return 1;
+        }
+    }
+
+    [HarmonyPatch]
     public static class LevelDataDecodePatch
     {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(
+                typeof(LevelData),
+                "Decode",
+                new Type[] { typeof(Dictionary<string, object>), typeof(LoadResult).MakeByRefType() });
+        }
+
         public static void Postfix(LevelData __instance)
         {
             try
@@ -3151,9 +2762,14 @@ namespace POMMax
         }
     }
 
-    [HarmonyPatch(typeof(scnGame), "LoadAndPlayLevel")]
+    [HarmonyPatch]
     public static class LoadAndPlayLevelPatch
     {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(scnGame), "LoadAndPlayLevel", new Type[] { typeof(string) });
+        }
+
         public static void Prefix(string levelPath)
         {
             if (!Main.IsLoadingLevel())
@@ -3164,15 +2780,24 @@ namespace POMMax
             Main.BeginLoading("LoadAndPlayLevel");
         }
 
-        public static void Postfix()
+        public static Exception Finalizer(Exception __exception)
         {
             Main.EndLoading("LoadAndPlayLevel");
+            return __exception;
         }
     }
 
-    [HarmonyPatch(typeof(scnGame), "LoadLevel")]
+    [HarmonyPatch]
     public static class ScnGameLoadLevelPatch
     {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(
+                typeof(scnGame),
+                "LoadLevel",
+                new Type[] { typeof(string), typeof(LoadResult).MakeByRefType() });
+        }
+
         public static void Prefix(string levelPath)
         {
             if (!Main.IsLoadingLevel())
@@ -3183,68 +2808,61 @@ namespace POMMax
             Main.BeginLoading("LoadLevel");
         }
 
-        public static void Postfix()
+        public static Exception Finalizer(Exception __exception)
         {
             Main.EndLoading("LoadLevel");
-        }
-
-        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
-        {
-            MethodInfo flush = AccessTools.Method(typeof(ADOBase), "FlushUnusedMemory");
-            MethodInfo unload = AccessTools.Method(typeof(Resources), "UnloadUnusedAssets", new Type[0]);
-            MethodInfo maybeFlush = AccessTools.Method(typeof(Main), "MaybeFlushUnusedMemory");
-            MethodInfo maybeUnload = AccessTools.Method(typeof(Main), "MaybeUnloadUnusedAssets");
-
-            foreach (CodeInstruction code in instructions)
-            {
-                MethodInfo operand = code.operand as MethodInfo;
-                if (operand == flush)
-                {
-                    yield return new CodeInstruction(OpCodes.Call, maybeFlush);
-                }
-                else if (operand == unload)
-                {
-                    yield return new CodeInstruction(OpCodes.Call, maybeUnload);
-                }
-                else
-                {
-                    yield return code;
-                }
-            }
+            return __exception;
         }
     }
 
-    [HarmonyPatch(typeof(scnGame), "ReloadAssets")]
+    [HarmonyPatch]
     public static class ReloadAssetsPatch
     {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(scnGame), "ReloadAssets", new Type[] { typeof(bool), typeof(bool) });
+        }
+
         public static void Prefix()
         {
             Main.BeginLoading("ReloadAssets");
         }
 
-        public static void Postfix()
+        public static Exception Finalizer(Exception __exception)
         {
             Main.EndLoading("ReloadAssets");
+            return __exception;
         }
     }
 
-    [HarmonyPatch(typeof(scnGame), "ResetScene")]
+    [HarmonyPatch]
     public static class ResetScenePatch
     {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(scnGame), "ResetScene", new Type[] { typeof(bool) });
+        }
+
         public static void Prefix()
         {
             Main.BeginLoading("ResetScene");
         }
 
-        public static void Postfix()
+        public static Exception Finalizer(Exception __exception)
         {
             Main.EndLoading("ResetScene");
+            return __exception;
         }
     }
 
-    [HarmonyPatch(typeof(scrController), "ResetCustomLevel")]
+    [HarmonyPatch]
     public static class ResetCustomLevelPatch
     {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(scrController), "ResetCustomLevel", new Type[] { typeof(bool) });
+        }
+
         public static void Postfix(ref IEnumerator __result)
         {
             __result = Main.WrapLoadingCoroutine(__result, "ResetCustomLevel");
@@ -3269,12 +2887,31 @@ namespace POMMax
         }
     }
 
-    [HarmonyPatch(typeof(TextureManager), "LoadTexture")]
+    [HarmonyPatch]
     public static class CustomTextureOptimizationPatch
     {
-        public static void Postfix(ref Texture2D __result, string filePath)
+        private static MethodBase TargetMethod()
         {
-            TextureOptimization.ProcessTexture(ref __result, filePath);
+            return AccessTools.Method(
+                typeof(TextureManager),
+                "LoadTexture",
+                new Type[] { typeof(string), typeof(LoadResult).MakeByRefType(), typeof(int) });
+        }
+
+        public static void Prefix(string filePath, ref int maxSideSize, out TextureOptimization.TextureLoadState __state)
+        {
+            __state = TextureOptimization.PrepareTextureLoad(filePath, ref maxSideSize);
+        }
+
+        public static void Postfix(Texture2D __result, TextureOptimization.TextureLoadState __state)
+        {
+            TextureOptimization.ProcessTexture(__result, __state);
+        }
+
+        public static Exception Finalizer(Exception __exception, TextureOptimization.TextureLoadState __state)
+        {
+            TextureOptimization.HandleTextureLoadFailure(__state, __exception);
+            return __exception;
         }
     }
 
@@ -3336,12 +2973,16 @@ namespace POMMax
         }
     }
 
-    [HarmonyPatch(typeof(scnGame), "UpdateDecorationObjects")]
+    [HarmonyPatch]
     public static class TextureOptimizationReportPatch
     {
+        private static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(scnGame), "UpdateDecorationObjects", new Type[] { typeof(bool) });
+        }
+
         public static void Postfix(bool reloadDecorations)
         {
-            Main.RefreshRuntimeDecorationBudget(reloadDecorations);
             TextureOptimization.ReportIfReady(reloadDecorations);
         }
     }

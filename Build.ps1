@@ -8,8 +8,42 @@ if ($env:ADOFAI_GAME_ROOT) {
 $candidateRoots += Split-Path -Parent (Split-Path -Parent $modDir)
 $candidateRoots += Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $modDir))
 
+$steamRoots = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($entry in @(
+    @('HKCU:\Software\Valve\Steam', 'SteamPath'),
+    @('HKLM:\Software\WOW6432Node\Valve\Steam', 'InstallPath'),
+    @('HKLM:\Software\Valve\Steam', 'InstallPath')
+)) {
+    try {
+        $value = (Get-ItemProperty -LiteralPath $entry[0] -Name $entry[1] -ErrorAction Stop).$($entry[1])
+        if ($value -and (Test-Path -LiteralPath $value -PathType Container)) {
+            [void]$steamRoots.Add([IO.Path]::GetFullPath($value))
+        }
+    }
+    catch {
+    }
+}
+
+foreach ($steamRoot in @($steamRoots)) {
+    $candidateRoots += Join-Path $steamRoot 'steamapps\common\A Dance of Fire and Ice'
+    $vdf = Join-Path $steamRoot 'steamapps\libraryfolders.vdf'
+    if (-not (Test-Path -LiteralPath $vdf -PathType Leaf)) {
+        continue
+    }
+
+    try {
+        $text = [IO.File]::ReadAllText($vdf)
+        foreach ($match in [Text.RegularExpressions.Regex]::Matches($text, '"path"\s*"([^"]+)"', 'IgnoreCase')) {
+            $library = $match.Groups[1].Value.Replace('\\', '\')
+            $candidateRoots += Join-Path $library 'steamapps\common\A Dance of Fire and Ice'
+        }
+    }
+    catch {
+    }
+}
+
 $gameRoot = $null
-foreach ($candidate in $candidateRoots) {
+foreach ($candidate in $candidateRoots | Select-Object -Unique) {
     if ($candidate -and (Test-Path (Join-Path $candidate 'A Dance of Fire and Ice_Data\Managed'))) {
         $gameRoot = $candidate
         break
@@ -50,6 +84,7 @@ $args = @(
     ('/reference:' + (Join-Path $managed 'netstandard.dll')),
     ('/reference:' + (Join-Path $managed 'Assembly-CSharp.dll')),
     ('/reference:' + (Join-Path $managed 'Assembly-CSharp-firstpass.dll')),
+    ('/reference:' + (Join-Path $managed 'DOTween.dll')),
     ('/reference:' + (Join-Path $managed 'RDTools.dll')),
     ('/reference:' + (Join-Path $managed 'UnityEngine.dll')),
     ('/reference:' + (Join-Path $managed 'UnityEngine.AudioModule.dll')),

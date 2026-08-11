@@ -1,6 +1,6 @@
 ﻿param(
     [string]$ProjectRoot = $PSScriptRoot,
-    [string]$OutputPath = (Join-Path $PSScriptRoot "release\POM-Max一键替换修复_HHS_20260728.cmd")
+    [string]$OutputPath = (Join-Path $PSScriptRoot "release\POM-Max-3.0.0-一键安装.cmd")
 )
 
 $ErrorActionPreference = "Stop"
@@ -235,12 +235,23 @@ function Select-GameRoot {
     return $null
 }
 
-function Test-GameRunning {
+function Test-GameRunning([string]$GameRoot) {
     try {
-        return @((Get-Process -Name "A Dance of Fire and Ice" -ErrorAction SilentlyContinue)).Count -gt 0
+        $targetExecutable = [IO.Path]::GetFullPath((Join-Path $GameRoot "A Dance of Fire and Ice.exe"))
+        $processes = Get-CimInstance Win32_Process -Filter "Name='A Dance of Fire and Ice.exe'" -ErrorAction Stop
+        foreach ($process in $processes) {
+            if (-not [string]::IsNullOrWhiteSpace($process.ExecutablePath) -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath($process.ExecutablePath),
+                    $targetExecutable,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        return $false
     }
     catch {
-        return $true
+        return @((Get-Process -Name "A Dance of Fire and Ice" -ErrorAction SilentlyContinue)).Count -gt 0
     }
 }
 
@@ -379,7 +390,7 @@ try {
     }
     Write-Ok ("目标目录：" + $gameRoot)
 
-    if (Test-GameRunning) {
+    if (Test-GameRunning $gameRoot) {
         throw "游戏仍在运行。请先关闭游戏，再重新执行本脚本。"
     }
 

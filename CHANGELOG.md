@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.0.0
+
+- Updated method-signature verification and patch targeting for ADOFAI 3.2.0-3.3.1 / Unity 6000.3.10f1.
+- Isolated Harmony patch installation so one missing optional target no longer prevents the entire Mod from loading.
+- Replaced post-decode duplicate RGBA texture creation with PNG/JPEG header inspection and the game's native `maxSideSize` loading path.
+- Added aspect-safe texture limits, a 32-pixel short-side floor, geometry compensation, conflict detection, and a three-failure session circuit breaker.
+- Added load-phase scheduling with reversible `backgroundLoadingPriority`, asynchronous upload time slices, and 32/64 MB upload buffers.
+- Added conservative DOTween capacity preallocation without replacing the game tween engine or enabling recyclable Tween behavior.
+- Removed chart-event mutation, decoration caps, background-video deletion, skipped cleanup, forced load timeout, background-process throttling, Windows power-plan changes, CPU affinity changes, and timer-resolution requests from active profiles.
+- Preserved all chart events, decorations, hitboxes, timing, editor data, and the original game texture loader on failure.
+- Added Steam multi-library discovery to the source build and refreshed the hash-verified, backup-first Chinese one-click installer.
+
 ## v2.1.5
 
 - Removed unsafe runtime decoration deactivation so linked decorations and effect controllers remain intact.
