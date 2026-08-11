@@ -26,7 +26,7 @@ POM-Max 3.0.0 does **not** delete chart events or decorations, replace `scrDecor
 
 ## Installation
 
-1. Download `POM-Max-3.0.0.zip` or `POM-Max-3.0.0-一键安装.cmd` from GitHub Releases.
+1. Download `POM-Max-3.0.0.zip` or `POM-Max-3.0.0-OneClick-Installer.cmd` from GitHub Releases.
 2. Exit the game.
 3. Install the ZIP with UnityModManager, or run the CMD and follow the Chinese prompts.
 4. Enable **Performance Optimization MAX** in UMM and select a profile.
