@@ -1,6 +1,6 @@
 ﻿param(
     [string]$ProjectRoot = $PSScriptRoot,
-    [string]$OutputPath = (Join-Path $PSScriptRoot "release\POM-Max-3.0.0-一键安装.cmd")
+    [string]$OutputPath = (Join-Path $PSScriptRoot "release\POM-Max-4.0.0-一键安装.cmd")
 )
 
 $ErrorActionPreference = "Stop"
@@ -235,24 +235,67 @@ function Select-GameRoot {
     return $null
 }
 
-function Test-GameRunning([string]$GameRoot) {
+function Get-TargetGameProcesses([string]$GameRoot) {
+    $targetExecutable = [IO.Path]::GetFullPath((Join-Path $GameRoot "A Dance of Fire and Ice.exe"))
+    $matches = New-Object Collections.Generic.List[object]
+    $seen = New-Object "Collections.Generic.HashSet[int]"
+
     try {
-        $targetExecutable = [IO.Path]::GetFullPath((Join-Path $GameRoot "A Dance of Fire and Ice.exe"))
-        $processes = Get-CimInstance Win32_Process -Filter "Name='A Dance of Fire and Ice.exe'" -ErrorAction Stop
-        foreach ($process in $processes) {
+        foreach ($process in Get-CimInstance Win32_Process -Filter "Name='A Dance of Fire and Ice.exe'" -ErrorAction Stop) {
             if (-not [string]::IsNullOrWhiteSpace($process.ExecutablePath) -and
                 [string]::Equals(
                     [IO.Path]::GetFullPath($process.ExecutablePath),
                     $targetExecutable,
-                    [StringComparison]::OrdinalIgnoreCase)) {
-                return $true
+                    [StringComparison]::OrdinalIgnoreCase) -and
+                $seen.Add([int]$process.ProcessId)) {
+                $matches.Add([pscustomobject]@{ Id = [int]$process.ProcessId; Path = $process.ExecutablePath })
             }
         }
-        return $false
     }
     catch {
-        return @((Get-Process -Name "A Dance of Fire and Ice" -ErrorAction SilentlyContinue)).Count -gt 0
     }
+
+    try {
+        foreach ($process in Get-Process -Name "A Dance of Fire and Ice" -ErrorAction SilentlyContinue) {
+            $processPath = $null
+            try { $processPath = $process.Path } catch { }
+            if (-not [string]::IsNullOrWhiteSpace($processPath) -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath($processPath),
+                    $targetExecutable,
+                    [StringComparison]::OrdinalIgnoreCase) -and
+                $seen.Add([int]$process.Id)) {
+                $matches.Add([pscustomobject]@{ Id = [int]$process.Id; Path = $processPath })
+            }
+        }
+    }
+    catch {
+    }
+
+    return $matches.ToArray()
+}
+
+function Stop-TargetGame([string]$GameRoot) {
+    $targets = @(Get-TargetGameProcesses $GameRoot)
+    if ($targets.Count -eq 0) {
+        Write-Ok "游戏当前没有运行"
+        return
+    }
+
+    Write-Step ("检测到游戏正在运行，正在结束进程：" + (($targets | ForEach-Object { $_.Id }) -join ", "))
+    foreach ($target in $targets) {
+        Stop-Process -Id $target.Id -Force -ErrorAction Stop
+    }
+
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        if (@(Get-TargetGameProcesses $GameRoot).Count -eq 0) {
+            Write-Ok "游戏进程已结束"
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "游戏进程没有在 5 秒内退出，安装已停止。"
 }
 
 function Test-IsAdministrator {
@@ -355,6 +398,15 @@ try {
     Write-Host "POM-Max 一键替换修复" -ForegroundColor White
     Write-Host "版本：$PayloadVersion" -ForegroundColor Gray
     Write-Host ""
+    Write-Host "本次更新" -ForegroundColor Yellow
+    Write-Host "  1. 新增平均帧时间、P95、P99、峰值、内存和渲染负载监测"
+    Write-Host "  2. 新增自适应纹理上传调度，游玩时自动降低上传抢占"
+    Write-Host "  3. 优化静态装饰位置、着色器状态和装饰碰撞检测热路径"
+    Write-Host "  4. 缓存 PNG/JPEG 尺寸信息，减少重复文件读取"
+    Write-Host "  5. 新增模块熔断、补丁冲突检查和运行身份诊断"
+    Write-Host "  6. 重做 UMM 界面，提供档位、高级参数和诊断页面"
+    Write-Host "  7. 自动迁移旧版风险设置，保留原生清理、特效、输入与判定逻辑"
+    Write-Host ""
 
     Write-Step "校验脚本内置文件"
     $dllBytes = Read-EmbeddedPayload "DLL"
@@ -390,10 +442,6 @@ try {
     }
     Write-Ok ("目标目录：" + $gameRoot)
 
-    if (Test-GameRunning $gameRoot) {
-        throw "游戏仍在运行。请先关闭游戏，再重新执行本脚本。"
-    }
-
     $modsDirectory = Join-Path $gameRoot "Mods"
     if (-not (Test-DirectoryWriteAccess $modsDirectory)) {
         if (-not (Test-IsAdministrator)) {
@@ -401,6 +449,8 @@ try {
         }
         throw "当前账户没有游戏 Mods 目录的写入权限。"
     }
+
+    Stop-TargetGame $gameRoot
 
     $modDirectory = Join-Path $modsDirectory "POMMax"
     [IO.Directory]::CreateDirectory($modsDirectory) | Out-Null
@@ -477,6 +527,7 @@ try {
     Write-Ok "POM-Max 已更新到 $PayloadVersion"
     Write-Host ("安装位置：" + $modDirectory) -ForegroundColor White
     Write-Host "个人配置未被覆盖；旧程序集缓存已清理。" -ForegroundColor White
+    Write-Host "V4 核心模块、中文界面与诊断功能已全部写入。" -ForegroundColor White
     Write-Host ("DLL SHA-256：" + $ExpectedDllSha256) -ForegroundColor DarkGray
     exit 0
 }

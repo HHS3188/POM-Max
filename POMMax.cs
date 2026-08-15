@@ -25,20 +25,20 @@ namespace POMMax
         public bool disableVSync = true;
         public bool disableAntiAliasing = true;
         public bool disableCustomFrameRateEvents = true;
-        public bool skipPreloadCleanup = true;
-        public bool optimizeLevelEvents = true;
-        public bool disableBackgroundVideo = true;
-        public bool capDecorations = true;
+        public bool skipPreloadCleanup = false;
+        public bool optimizeLevelEvents = false;
+        public bool disableBackgroundVideo = false;
+        public bool capDecorations = false;
         public int maxDecorations = 20000;
         public bool simplifyDecorationShaders = false;
-        public bool throttleDecorationUpdates = true;
+        public bool throttleDecorationUpdates = false;
         public int decorationUpdateStride = 2;
-        public bool enableLoadTimeout = true;
+        public bool enableLoadTimeout = false;
         public int maxLoadSeconds = 45;
         public bool boostGamePriority = true;
         public bool preventSleepDuringGameplay = true;
         public bool overdriveMode = false;
-        public bool throttleBackgroundProcesses = true;
+        public bool throttleBackgroundProcesses = false;
         public bool verboseLogging = false;
         public bool optimizeCustomTextures = true;
         public float textureScaleDivisor = 1f;
@@ -46,6 +46,21 @@ namespace POMMax
         public bool roundTextureDimensionsToMultipleOf4 = true;
         public bool adjustTextureGeometry = true;
         public bool showTextureOptimizationStats = true;
+
+        // V4 runtime modules. These defaults are intentionally conservative and
+        // are migrated automatically when an older Settings.xml is loaded.
+        public bool enableTelemetry = true;
+        public int telemetryWindowSeconds = 5;
+        public bool adaptiveUploadBudget = true;
+        public int loadingUploadTimeSlice = 8;
+        public int gameplayUploadTimeSlice = 2;
+        public bool optimizeStaticDecorationPosition = true;
+        public bool cacheStaticDecorationShaders = true;
+        public bool filterDecorationHitboxLoop = true;
+        public int hitboxRefreshMilliseconds = 1000;
+        public int textureMinimumShortSide = 32;
+        public int textureHeaderCacheEntries = 4096;
+        public bool reportPatchConflicts = true;
 
         public override void Save(UnityModManager.ModEntry modEntry)
         {
@@ -99,6 +114,7 @@ namespace POMMax
         private static ProcessPriorityClass originalOwnPriority;
         private static int configuredTweenerCapacity;
         private static int configuredSequenceCapacity;
+        private static int selectedUiTab;
         [DllImport("kernel32.dll")]
         private static extern uint SetThreadExecutionState(uint flags);
 
@@ -107,7 +123,6 @@ namespace POMMax
             modEntry = entry;
             settings = UnityModManager.ModSettings.Load<Settings>(entry);
             ClampSettings();
-            ApplySelectedProfilePreset(false);
 
             entry.OnToggle = OnToggle;
             entry.OnGUI = OnGUI;
@@ -140,11 +155,13 @@ namespace POMMax
                     ApplyProcessBoost(true);
                     TextureOptimization.RefreshCompatibilityState(true);
                     CompatibilityDiagnostics.Report();
+                    V4Runtime.Enable();
                     entry.Logger.Log("POM Max enabled. " + GetProfileDiagnosticText());
                 }
                 else
                 {
                     modEnabled = false;
+                    V4Runtime.Disable();
                     OptimizationNotificationOverlay.Hide();
                     loadingActive = false;
                     loadingDepth = 0;
@@ -178,6 +195,7 @@ namespace POMMax
         private static bool OnUnload(UnityModManager.ModEntry entry)
         {
             modEnabled = false;
+            V4Runtime.Disable();
             RestoreRuntimeDecorations();
             TextureOptimization.ResetSession(true);
             RestoreRuntimeSettings();
@@ -247,6 +265,7 @@ namespace POMMax
             {
                 loadingActive = false;
                 loadingDepth = 0;
+                V4Runtime.Disable();
                 RestoreRuntimeDecorations();
                 TextureOptimization.ResetSession(true);
                 RestoreRuntimeSettings();
@@ -271,6 +290,7 @@ namespace POMMax
             }
 
             float now = Time.realtimeSinceStartup;
+            V4Runtime.Tick(deltaTime, now);
             TextureOptimization.Tick(now);
             if (now >= nextRuntimeApply)
             {
@@ -299,33 +319,31 @@ namespace POMMax
                 GUILayout.EndHorizontal();
 
                 GUILayout.Space(12f);
-                GUILayout.BeginVertical(GuiTheme.Panel, GUILayout.ExpandWidth(true));
-                GUILayout.Label(Text("profile"), GuiTheme.Subtitle);
-                GUILayout.Space(8f);
                 GUILayout.BeginHorizontal();
-                DrawProfileButton(ProfileOff, Text("profileOff"));
-                DrawProfileButton(ProfileMax, Text("profileMax"));
-                DrawOverdriveButton();
+                DrawTabButton(0, V4Runtime.Text("tabOverview"));
+                DrawTabButton(1, V4Runtime.Text("tabProfiles"));
+                DrawTabButton(2, V4Runtime.Text("tabAdvanced"));
+                DrawTabButton(3, V4Runtime.Text("tabDiagnostics"));
                 GUILayout.EndHorizontal();
 
-                GUILayout.Space(14f);
-                GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
-                GUILayout.Label(GetSelectedProfileName(), GuiTheme.CardTitle);
-                GUILayout.Space(3f);
-                GUILayout.Label(GetSelectedProfileDescription(), GuiTheme.Body);
-                GUILayout.Space(3f);
-                GUILayout.Label(GetSelectedProfileConfiguration(), GuiTheme.Secondary);
-                GUILayout.EndVertical();
-
                 GUILayout.Space(10f);
-                GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
-                GUILayout.Label(Text("latestResult"), GuiTheme.CardTitle);
-                GUILayout.Space(4f);
-                GUILayout.Label(TextureOptimization.GetStatusText(settings.language), GuiTheme.Body);
-                GUILayout.EndVertical();
-
-                GUILayout.Space(9f);
-                GUILayout.Label(Text("profileApplyNote"), GuiTheme.Secondary);
+                GUILayout.BeginVertical(GuiTheme.Panel, GUILayout.ExpandWidth(true));
+                if (selectedUiTab == 0)
+                {
+                    DrawOverviewTab();
+                }
+                else if (selectedUiTab == 1)
+                {
+                    DrawProfilesTab();
+                }
+                else if (selectedUiTab == 2)
+                {
+                    DrawAdvancedTab();
+                }
+                else
+                {
+                    DrawDiagnosticsTab();
+                }
                 GUILayout.EndVertical();
                 GUILayout.EndVertical();
             }
@@ -339,9 +357,158 @@ namespace POMMax
 
         private static void OnSaveGUI(UnityModManager.ModEntry entry)
         {
-            ApplySelectedProfilePreset(false);
             ClampSettings();
+            V4Runtime.OnSettingsChanged();
+            if (modEnabled)
+            {
+                RestoreRuntimeSettings();
+                ApplyProcessBoost(false);
+                if (EffectiveProfile() > ProfileOff)
+                {
+                    CaptureQualitySettings();
+                    ApplyRuntimePerformance(true);
+                    ApplyProcessBoost(true);
+                }
+            }
             settings.Save(entry);
+        }
+
+        private static void DrawTabButton(int tab, string label)
+        {
+            bool selected = selectedUiTab == tab;
+            if (GUILayout.Button(
+                label,
+                selected ? GuiTheme.ProfileButtonSelected : GuiTheme.ProfileButton,
+                GUILayout.ExpandWidth(true),
+                GUILayout.Height(38f)))
+            {
+                selectedUiTab = tab;
+            }
+        }
+
+        private static void DrawOverviewTab()
+        {
+            GUILayout.Label(V4Runtime.Text("overviewTitle"), GuiTheme.Subtitle);
+            GUILayout.Space(8f);
+
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(GetSelectedProfileName(), GuiTheme.CardTitle);
+            GUILayout.Space(3f);
+            GUILayout.Label(GetSelectedProfileDescription(), GuiTheme.Body);
+            GUILayout.Space(5f);
+            GUILayout.Label(V4Runtime.GetLiveSummary(), GuiTheme.Body);
+            GUILayout.EndVertical();
+
+            GUILayout.Space(10f);
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(Text("latestResult"), GuiTheme.CardTitle);
+            GUILayout.Space(4f);
+            GUILayout.Label(TextureOptimization.GetStatusText(settings.language), GuiTheme.Body);
+            GUILayout.EndVertical();
+        }
+
+        private static void DrawProfilesTab()
+        {
+            GUILayout.Label(Text("profile"), GuiTheme.Subtitle);
+            GUILayout.Space(8f);
+            GUILayout.BeginHorizontal();
+            DrawProfileButton(ProfileOff, Text("profileOff"));
+            DrawProfileButton(ProfileMax, Text("profileMax"));
+            DrawOverdriveButton();
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(14f);
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(GetSelectedProfileName(), GuiTheme.CardTitle);
+            GUILayout.Space(3f);
+            GUILayout.Label(GetSelectedProfileDescription(), GuiTheme.Body);
+            GUILayout.Space(4f);
+            GUILayout.Label(GetSelectedProfileConfiguration(), GuiTheme.Secondary);
+            GUILayout.EndVertical();
+
+            GUILayout.Space(9f);
+            GUILayout.Label(V4Runtime.Text("profileAdvancedNote"), GuiTheme.Secondary);
+        }
+
+        private static void DrawAdvancedTab()
+        {
+            GUILayout.Label(V4Runtime.Text("advancedTitle"), GuiTheme.Subtitle);
+            GUILayout.Space(8f);
+
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(V4Runtime.Text("runtimeGroup"), GuiTheme.CardTitle);
+            DrawIntField(Text("targetFps"), ref settings.targetFps, 30, 10000, 90);
+            DrawToggleRow(V4Runtime.Text("telemetry"), ref settings.enableTelemetry);
+            DrawIntField(V4Runtime.Text("telemetryWindow"), ref settings.telemetryWindowSeconds, 2, 30, 90);
+            DrawToggleRow(V4Runtime.Text("adaptiveUpload"), ref settings.adaptiveUploadBudget);
+            DrawIntField(V4Runtime.Text("loadingSlice"), ref settings.loadingUploadTimeSlice, 2, 32, 90);
+            DrawIntField(V4Runtime.Text("gameplaySlice"), ref settings.gameplayUploadTimeSlice, 1, 8, 90);
+            GUILayout.EndVertical();
+
+            GUILayout.Space(8f);
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(V4Runtime.Text("decorationGroup"), GuiTheme.CardTitle);
+            DrawToggleRow(V4Runtime.Text("staticPosition"), ref settings.optimizeStaticDecorationPosition);
+            DrawToggleRow(V4Runtime.Text("staticShader"), ref settings.cacheStaticDecorationShaders);
+            DrawToggleRow(V4Runtime.Text("hitboxFilter"), ref settings.filterDecorationHitboxLoop);
+            DrawIntField(V4Runtime.Text("hitboxRefresh"), ref settings.hitboxRefreshMilliseconds, 100, 5000, 90);
+            GUILayout.Label(V4Runtime.Text("decorationSafety"), GuiTheme.Secondary);
+            GUILayout.EndVertical();
+
+            GUILayout.Space(8f);
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(V4Runtime.Text("textureGroup"), GuiTheme.CardTitle);
+            DrawToggleRow(Text("optimizeTextures"), ref settings.optimizeCustomTextures);
+            DrawFloatField(Text("textureDivisor"), ref settings.textureScaleDivisor, 1f, 8f, 90);
+            DrawIntField(V4Runtime.Text("textureFloor"), ref settings.textureMinimumShortSide, 16, 256, 90);
+            DrawIntField(V4Runtime.Text("textureCache"), ref settings.textureHeaderCacheEntries, 128, 16384, 90);
+            DrawToggleRow(Text("adjustTextureGeometry"), ref settings.adjustTextureGeometry);
+            DrawToggleRow(Text("showTextureStats"), ref settings.showTextureOptimizationStats);
+            GUILayout.EndVertical();
+
+            GUILayout.Space(8f);
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(V4Runtime.Text("systemGroup"), GuiTheme.CardTitle);
+            DrawToggleRow(Text("forceFps"), ref settings.forceTargetFrameRate);
+            DrawToggleRow(Text("disableVsync"), ref settings.disableVSync);
+            DrawToggleRow(Text("disableAa"), ref settings.disableAntiAliasing);
+            DrawToggleRow(Text("blockFrameEvents"), ref settings.disableCustomFrameRateEvents);
+            DrawToggleRow(Text("boostPriority"), ref settings.boostGamePriority);
+            DrawToggleRow(Text("preventSleep"), ref settings.preventSleepDuringGameplay);
+            DrawToggleRow(V4Runtime.Text("patchConflicts"), ref settings.reportPatchConflicts);
+            DrawToggleRow(Text("verbose"), ref settings.verboseLogging);
+            GUILayout.EndVertical();
+        }
+
+        private static void DrawDiagnosticsTab()
+        {
+            GUILayout.Label(V4Runtime.Text("diagnosticsTitle"), GuiTheme.Subtitle);
+            GUILayout.Space(8f);
+            GUILayout.BeginVertical(GuiTheme.Card, GUILayout.ExpandWidth(true));
+            GUILayout.Label(V4Runtime.Text("runtimeDiagnostics"), GuiTheme.CardTitle);
+            GUILayout.Space(4f);
+            GUILayout.Label(V4Runtime.GetDiagnosticsText(), GuiTheme.Body);
+            GUILayout.EndVertical();
+
+            GUILayout.Space(8f);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button(Text("docsLink"), GuiTheme.SmallButton, GUILayout.Height(34f)))
+            {
+                OpenUrl(DocsUrl);
+            }
+            if (GUILayout.Button(Text("sourceLink"), GuiTheme.SmallButton, GUILayout.Height(34f)))
+            {
+                OpenUrl(SourceUrl);
+            }
+            GUILayout.EndHorizontal();
+        }
+
+        private static void DrawToggleRow(string label, ref bool value)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, GuiTheme.Body, GUILayout.ExpandWidth(true));
+            value = GUILayout.Toggle(value, value ? V4Runtime.Text("enabled") : V4Runtime.Text("disabled"), GUILayout.Width(100f));
+            GUILayout.EndHorizontal();
         }
 
         public static int EffectiveProfile()
@@ -371,10 +538,12 @@ namespace POMMax
 
         public static void ResetRuntimeDecorationBudget()
         {
+            V4Runtime.ResetLevelState();
         }
 
         private static void RestoreRuntimeDecorations()
         {
+            V4Runtime.ResetLevelState();
         }
 
         public static bool ShouldBlockCustomFrameRate(bool enable)
@@ -420,6 +589,7 @@ namespace POMMax
             loadingActive = true;
             loadingStartedAt = Time.realtimeSinceStartup;
             loadingLabel = label ?? "Loading";
+            V4Runtime.BeginLevelLoad(loadingLabel);
             ApplyLoadingPolicy(true);
             Verbose("Loading started: " + loadingLabel);
         }
@@ -444,6 +614,7 @@ namespace POMMax
             float elapsed = Time.realtimeSinceStartup - loadingStartedAt;
             loadingActive = false;
             ApplyLoadingPolicy(false);
+            V4Runtime.EndLevelLoad(elapsed);
             TextureOptimization.RecordLoadingDuration(elapsed);
             Verbose("Loading finished: " + (label ?? loadingLabel) + " in " + elapsed.ToString("0.00") + "s.");
         }
@@ -702,6 +873,23 @@ namespace POMMax
             settings.maxDecorations = Clamp(settings.maxDecorations, 100, 100000);
             settings.decorationUpdateStride = Clamp(settings.decorationUpdateStride, 1, 8);
             settings.textureScaleDivisor = Clamp(settings.textureScaleDivisor, 1f, 8f);
+            settings.telemetryWindowSeconds = Clamp(settings.telemetryWindowSeconds, 2, 30);
+            settings.loadingUploadTimeSlice = Clamp(settings.loadingUploadTimeSlice, 2, 32);
+            settings.gameplayUploadTimeSlice = Clamp(settings.gameplayUploadTimeSlice, 1, 8);
+            settings.hitboxRefreshMilliseconds = Clamp(settings.hitboxRefreshMilliseconds, 100, 5000);
+            settings.textureMinimumShortSide = Clamp(settings.textureMinimumShortSide, 16, 256);
+            settings.textureHeaderCacheEntries = Clamp(settings.textureHeaderCacheEntries, 128, 16384);
+
+            // Migrate V1-V3 settings that traded correctness for shorter loads.
+            // V4 always preserves the game's cleanup and visual lifecycle.
+            settings.skipPreloadCleanup = false;
+            settings.optimizeLevelEvents = false;
+            settings.disableBackgroundVideo = false;
+            settings.capDecorations = false;
+            settings.simplifyDecorationShaders = false;
+            settings.throttleDecorationUpdates = false;
+            settings.enableLoadTimeout = false;
+            settings.throttleBackgroundProcesses = false;
         }
 
         private static int Clamp(int value, int min, int max)
@@ -784,9 +972,7 @@ namespace POMMax
                 Application.backgroundLoadingPriority = loading
                     ? UnityEngine.ThreadPriority.High
                     : UnityEngine.ThreadPriority.Normal;
-                QualitySettings.asyncUploadTimeSlice = loading
-                    ? (IsOverdriveMode() ? 8 : 4)
-                    : 2;
+                QualitySettings.asyncUploadTimeSlice = V4Runtime.GetAsyncUploadTimeSlice(loading);
             }
             catch (Exception ex)
             {
@@ -857,6 +1043,7 @@ namespace POMMax
 
             RestoreRuntimeDecorations();
             TextureOptimization.ResetSession(true);
+            V4Runtime.OnSettingsChanged();
             ApplyProcessBoost(false);
             RestoreRuntimeSettings();
 
@@ -896,6 +1083,18 @@ namespace POMMax
             settings.roundTextureDimensionsToMultipleOf4 = false;
             settings.adjustTextureGeometry = true;
             settings.showTextureOptimizationStats = false;
+            settings.enableTelemetry = true;
+            settings.telemetryWindowSeconds = 5;
+            settings.adaptiveUploadBudget = false;
+            settings.loadingUploadTimeSlice = 4;
+            settings.gameplayUploadTimeSlice = 2;
+            settings.optimizeStaticDecorationPosition = false;
+            settings.cacheStaticDecorationShaders = false;
+            settings.filterDecorationHitboxLoop = false;
+            settings.hitboxRefreshMilliseconds = 1000;
+            settings.textureMinimumShortSide = 32;
+            settings.textureHeaderCacheEntries = 4096;
+            settings.reportPatchConflicts = true;
         }
 
         private static void ApplyMaxPreset()
@@ -927,6 +1126,18 @@ namespace POMMax
             settings.roundTextureDimensionsToMultipleOf4 = true;
             settings.adjustTextureGeometry = true;
             settings.showTextureOptimizationStats = true;
+            settings.enableTelemetry = true;
+            settings.telemetryWindowSeconds = 5;
+            settings.adaptiveUploadBudget = true;
+            settings.loadingUploadTimeSlice = 8;
+            settings.gameplayUploadTimeSlice = 2;
+            settings.optimizeStaticDecorationPosition = true;
+            settings.cacheStaticDecorationShaders = true;
+            settings.filterDecorationHitboxLoop = true;
+            settings.hitboxRefreshMilliseconds = 500;
+            settings.textureMinimumShortSide = 32;
+            settings.textureHeaderCacheEntries = 4096;
+            settings.reportPatchConflicts = true;
         }
 
         private static void ApplyExtremePreset()
@@ -958,6 +1169,18 @@ namespace POMMax
             settings.roundTextureDimensionsToMultipleOf4 = true;
             settings.adjustTextureGeometry = true;
             settings.showTextureOptimizationStats = true;
+            settings.enableTelemetry = true;
+            settings.telemetryWindowSeconds = 8;
+            settings.adaptiveUploadBudget = true;
+            settings.loadingUploadTimeSlice = 12;
+            settings.gameplayUploadTimeSlice = 1;
+            settings.optimizeStaticDecorationPosition = true;
+            settings.cacheStaticDecorationShaders = true;
+            settings.filterDecorationHitboxLoop = true;
+            settings.hitboxRefreshMilliseconds = 250;
+            settings.textureMinimumShortSide = 32;
+            settings.textureHeaderCacheEntries = 8192;
+            settings.reportPatchConflicts = true;
         }
 
         private static string GetSelectedProfileName()
@@ -997,7 +1220,11 @@ namespace POMMax
                 + ", targetFps=" + settings.targetFps
                 + ", textureDivisor=" + settings.textureScaleDivisor.ToString("0.##", CultureInfo.InvariantCulture)
                 + ", asyncUploadBufferMB=" + (settings.overdriveMode ? 64 : 32)
+                + ", uploadSlice=" + settings.loadingUploadTimeSlice + "/" + settings.gameplayUploadTimeSlice
                 + ", tweenCapacity=" + (settings.overdriveMode ? 4000 : 1500)
+                + ", staticPosition=" + settings.optimizeStaticDecorationPosition
+                + ", shaderCache=" + settings.cacheStaticDecorationShaders
+                + ", hitboxFilter=" + settings.filterDecorationHitboxLoop
                 + ", chartDataPreserved=true"
                 + ".";
         }
@@ -1684,7 +1911,7 @@ namespace POMMax
             {
                 int originalWidth;
                 int originalHeight;
-                if (!TryReadImageDimensions(filePath, out originalWidth, out originalHeight))
+                if (!V4TextureHeaderCache.TryGetDimensions(filePath, out originalWidth, out originalHeight))
                 {
                     skippedCount++;
                     return state;
@@ -1704,9 +1931,10 @@ namespace POMMax
                 int maximumSide = Math.Max(originalWidth, originalHeight);
                 int minimumSide = Math.Min(originalWidth, originalHeight);
                 float scale = 1f / divisor;
-                if (minimumSide > 0 && minimumSide * scale < 32f)
+                float safetyFloor = Mathf.Max(16f, Main.settings.textureMinimumShortSide);
+                if (minimumSide > 0 && minimumSide * scale < safetyFloor)
                 {
-                    scale = Math.Min(1f, 32f / minimumSide);
+                    scale = Math.Min(1f, safetyFloor / minimumSide);
                 }
 
                 int targetMaximumSide = Math.Max(4, Mathf.RoundToInt(maximumSide * scale));
@@ -2362,7 +2590,7 @@ namespace POMMax
             return ShouldOptimize() && Main.settings.adjustTextureGeometry;
         }
 
-        private static bool TryReadImageDimensions(string filePath, out int width, out int height)
+        internal static bool TryReadImageDimensionsUncached(string filePath, out int width, out int height)
         {
             width = 0;
             height = 0;
@@ -2707,6 +2935,9 @@ namespace POMMax
                 "LoadTexture",
                 new Type[] { typeof(string), typeof(LoadResult).MakeByRefType(), typeof(int) });
             missing += Check(typeof(scnGame), "UpdateDecorationObjects", new Type[] { typeof(bool) });
+            missing += Check(typeof(scrDecoration), "LogicUpdate", new Type[] { typeof(bool) });
+            missing += Check(typeof(scrVisualDecoration), "UpdateShader", new Type[] { typeof(bool) });
+            missing += Check(typeof(scrDecorationManager), "Update", Type.EmptyTypes);
 
             if (missing == 0)
             {

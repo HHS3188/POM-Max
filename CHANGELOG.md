@@ -1,5 +1,21 @@
 # Changelog
 
+## v4.0.0
+
+- Automatically migrates legacy high-risk hidden settings so V4 always preserves the game's native cleanup, video, decoration, and loading lifecycle.
+- Limits shader-state caching to static decorations without component drivers, event tweens, filters, masks, or blend overrides.
+- Publishes a directly downloadable Chinese one-click CMD installer that shows the V4 changes, closes the matching game process, preserves settings, verifies hashes, and rolls back failed writes.
+- Added allocation-bounded frame telemetry with average, P95, P99, maximum frame time, managed memory, render counters, and per-level runtime evidence logs.
+- Added an adaptive asynchronous-upload scheduler that changes only POM-Max-owned Unity upload budgets and keeps gameplay input, timing, and judgement paths untouched.
+- Added a conservative static-decoration transform fast path. Planet-following, floor-attached, parallax, component-driven, tweened, editor, and dynamically changing decorations retain the original game path.
+- Added a fingerprinted visual-decoration shader cache with instance-identity validation. Filters, masks, blend modes, active tweens, patch conflicts, or repeated failures disable the fast path and restore original behavior.
+- Replaced the game-wide decoration hitbox scan with a periodically revalidated list containing only active decoration-target hitboxes.
+- Added a bounded PNG/JPEG header cache keyed by normalized path, write time, and file length to avoid repeatedly reading unchanged texture metadata.
+- Added per-module circuit breakers, Harmony owner audits outside the gameplay hot path, and Assembly-CSharp MVID diagnostics.
+- Rebuilt the UMM page into Overview, Profiles, Advanced, and Diagnostics tabs with Chinese, English, and Korean labels.
+- Preserved advanced overrides when saving settings. Changing a profile deliberately reloads that profile's recommended values.
+- Continued to preserve chart events, decoration objects, hitboxes, input, judgement, editor data, game assemblies, and Together files.
+
 ## v3.0.0
 
 - Updated method-signature verification and patch targeting for ADOFAI 3.2.0-3.3.1 / Unity 6000.3.10f1.

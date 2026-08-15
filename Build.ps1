@@ -63,7 +63,10 @@ if (-not $windowsRoot) {
 $csc = Join-Path $windowsRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $dist = Join-Path $modDir 'dist'
 $output = Join-Path $dist 'POMMax.dll'
-$source = Join-Path $modDir 'POMMax.cs'
+$sources = @(
+    (Join-Path $modDir 'POMMax.cs'),
+    (Join-Path $modDir 'POMMaxV4.cs')
+)
 
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 
@@ -95,9 +98,9 @@ $args = @(
     ('/reference:' + (Join-Path $managed 'UnityEngine.TextRenderingModule.dll')),
     ('/reference:' + (Join-Path $managed 'UnityEngine.VideoModule.dll')),
     ('/reference:' + (Join-Path $umm '0Harmony.dll')),
-    ('/reference:' + (Join-Path $umm 'UnityModManager.dll')),
-    $source
+    ('/reference:' + (Join-Path $umm 'UnityModManager.dll'))
 )
+$args += $sources
 
 & $csc @args
 if ($LASTEXITCODE -ne 0) {
