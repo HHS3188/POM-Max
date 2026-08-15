@@ -2,7 +2,7 @@
 
 ## 直接下载
 
-- `POM-Max-4.0.0-一键安装.cmd`：直接下载并运行，不需要手动解压
+- `POM-Max-4.0.0-OneClick-Installer.cmd`：直接下载并运行，不需要手动解压；使用 ASCII 文件名避免 GitHub 和旧版 Windows 丢失中文字符
 - `POM-Max-4.0.0.zip`：供 UnityModManager 手动安装
 - `SHA256SUMS-4.0.0.txt`：用于校验两个安装产物
 

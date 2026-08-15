@@ -1,6 +1,6 @@
 ﻿param(
     [string]$ProjectRoot = $PSScriptRoot,
-    [string]$OutputPath = (Join-Path $PSScriptRoot "release\POM-Max-4.0.0-一键安装.cmd")
+    [string]$OutputPath = (Join-Path $PSScriptRoot "release\POM-Max-4.0.0-OneClick-Installer.cmd")
 )
 
 $ErrorActionPreference = "Stop"

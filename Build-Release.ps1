@@ -12,14 +12,16 @@ $dllPath = Join-Path $root 'dist\POMMax.dll'
 $info = Get-Content -LiteralPath $infoPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $version = [string]$info.Version
 $zipPath = Join-Path $releaseDirectory ("POM-Max-$version.zip")
-$cmdPath = Join-Path $releaseDirectory ("POM-Max-$version-一键安装.cmd")
+$cmdPath = Join-Path $releaseDirectory ("POM-Max-$version-OneClick-Installer.cmd")
 $checksumsPath = Join-Path $releaseDirectory ("SHA256SUMS-$version.txt")
+$legacyCmdPath = Join-Path $releaseDirectory ("POM-Max-$version-一键安装.cmd")
 
 if (-not (Test-Path -LiteralPath $cmdPath -PathType Leaf)) {
     throw "Installer was not generated: $cmdPath"
 }
 
 New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
+Remove-Item -LiteralPath $legacyCmdPath -Force -ErrorAction SilentlyContinue
 $stagingRoot = Join-Path ([IO.Path]::GetTempPath()) ('pommax-release-' + [Guid]::NewGuid().ToString('N'))
 $stagingMod = Join-Path $stagingRoot 'POMMax'
 $temporaryZip = Join-Path $releaseDirectory (".POM-Max-$version-" + [Guid]::NewGuid().ToString('N') + '.tmp.zip')

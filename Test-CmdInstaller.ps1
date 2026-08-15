@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$installerSource = Join-Path $root 'release\POM-Max-4.0.0-一键安装.cmd'
+$installerSource = Join-Path $root 'release\POM-Max-4.0.0-OneClick-Installer.cmd'
 $expectedDll = Join-Path $root 'dist\POMMax.dll'
 $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 $testRoot = Join-Path $tempBase ('POMMaxV4ReleaseTest_' + [Guid]::NewGuid().ToString('N'))
@@ -32,7 +32,7 @@ try {
     $settings = 'PRESERVE-ME'
     [IO.File]::WriteAllText((Join-Path $modDirectory 'Settings.xml'), $settings, [Text.Encoding]::ASCII)
 
-    $installerPath = Join-Path $gameRoot 'POM-Max-4.0.0-一键安装.cmd'
+    $installerPath = Join-Path $gameRoot 'POM-Max-4.0.0-OneClick-Installer.cmd'
     Copy-Item -LiteralPath $installerSource -Destination $installerPath
 
     $testProcess = Start-Process `
